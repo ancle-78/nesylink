@@ -1,0 +1,110 @@
+{
+  "id": "center",
+  "coord": [0, 0],
+  "layout": [
+    "..........",
+    "..........",
+    "..........",
+    "..........",
+    "..........",
+    "..........",
+    "..........",
+    ".........."
+  ],
+  "spawns": {
+    "default": [1, 4],
+    "west_door": [1, 4],
+    "east_door": [8, 4],
+    "from_north": [4, 1],
+    "from_south": [4, 6]
+  },
+  "default_spawn": "default",
+  "objects": [
+    {
+      "id": "center_abyss",
+      "kind": "trap",
+      "trap_type": "abyss",
+      "damage": 1,
+      "respawn_delay_steps": 2,
+      "rects": [{"from": [0, 0], "to": [9, 7]}]
+    },
+    {
+      "id": "final_chest",
+      "kind": "chest",
+      "pos": [4, 4],
+      "hidden": true,
+      "reveal_on": {
+        "event": "all_monsters_defeated",
+        "room_id": "south"
+      },
+      "loot": {"kind": "gold", "amount": 1}
+    }
+  ],
+  "dynamic_objects": [
+    {
+      "id": "center_bridge",
+      "kind": "rotating_bridge",
+      "initial_state": "west_to_north",
+      "background_tile": "none",
+      "active_tile": "bridge",
+      "states": {
+        "west_to_north": {
+          "tiles": [
+            [0, 3], [1, 3], [2, 3], [3, 3], [4, 3], [5, 3],
+            [0, 4], [1, 4], [2, 4], [3, 4], [4, 4], [5, 4],
+            [4, 0], [5, 0], [4, 1], [5, 1], [4, 2], [5, 2]
+          ]
+        },
+        "west_to_east": {
+          "tiles": [
+            [0, 3], [1, 3], [2, 3], [3, 3], [4, 3], [5, 3], [6, 3], [7, 3], [8, 3], [9, 3],
+            [0, 4], [1, 4], [2, 4], [3, 4], [4, 4], [5, 4], [6, 4], [7, 4], [8, 4], [9, 4]
+          ]
+        },
+        "west_to_south": {
+          "tiles": [
+            [0, 3], [1, 3], [2, 3], [3, 3], [4, 3], [5, 3],
+            [0, 4], [1, 4], [2, 4], [3, 4], [4, 4], [5, 4],
+            [4, 5], [5, 5], [4, 6], [5, 6], [4, 7], [5, 7]
+          ]
+        }
+      }
+    }
+  ],
+  "exits": [
+    {
+      "id": "west_exit",
+      "direction": "west",
+      "target_room": "west",
+      "target_entry": "east_door",
+      "type": "normal",
+      "success_message": "WEST"
+    },
+    {
+      "id": "east_exit",
+      "direction": "east",
+      "target_room": "east",
+      "target_entry": "west_door",
+      "type": "locked_key",
+      "requires": {"key_count": 1, "consume_key": false},
+      "blocked_message": "NEED KEY",
+      "success_message": "SWORD ROOM"
+    },
+    {
+      "id": "north_exit",
+      "direction": "north",
+      "target_room": "north",
+      "target_entry": "from_south",
+      "type": "normal",
+      "success_message": "KEY ROOM"
+    },
+    {
+      "id": "south_exit",
+      "direction": "south",
+      "target_room": "south",
+      "target_entry": "from_north",
+      "type": "normal",
+      "success_message": "MONSTER ROOM"
+    }
+  ]
+}

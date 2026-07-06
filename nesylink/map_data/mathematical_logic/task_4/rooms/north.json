@@ -1,0 +1,37 @@
+{
+  "id": "north",
+  "coord": [0, -1],
+  "layout": [
+    "##########",
+    "#........#",
+    "#........#",
+    "#........#",
+    "#........#",
+    "#........#",
+    "#........#",
+    "####..####"
+  ],
+  "spawns": {
+    "default": [4, 6],
+    "from_south": [4, 6]
+  },
+  "default_spawn": "default",
+  "objects": [
+    {
+      "id": "key_chest",
+      "kind": "chest",
+      "pos": [4, 3],
+      "loot": {"kind": "key", "key_id": "bridge_key"}
+    }
+  ],
+  "exits": [
+    {
+      "id": "south_exit",
+      "direction": "south",
+      "target_room": "center",
+      "target_entry": "from_north",
+      "type": "normal",
+      "success_message": "CENTER"
+    }
+  ]
+}

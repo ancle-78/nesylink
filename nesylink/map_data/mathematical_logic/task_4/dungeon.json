@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "dungeon_id": "task_dynamic_bridge",
+  "start_room": "west",
+  "player_config": {
+    "items": ["shield"],
+    "tools": ["shield"],
+    "equipped": {"A": "none", "B": "shield"}
+  },
+  "room_files": [
+    "rooms/west.json",
+    "rooms/center.json",
+    "rooms/north.json",
+    "rooms/east.json",
+    "rooms/south.json"
+  ]
+}

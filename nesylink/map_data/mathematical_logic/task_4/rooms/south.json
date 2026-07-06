@@ -1,0 +1,39 @@
+{
+  "id": "south",
+  "coord": [0, 1],
+  "layout": [
+    "####..####",
+    "#........#",
+    "#........#",
+    "#........#",
+    "#........#",
+    "#........#",
+    "#........#",
+    "##########"
+  ],
+  "spawns": {
+    "default": [4, 1],
+    "from_north": [4, 1]
+  },
+  "default_spawn": "default",
+  "objects": [
+    {
+      "id": "guardian",
+      "kind": "monster",
+      "pos": [4, 4],
+      "monster_type": "chaser",
+      "hp": 1,
+      "damage": 1
+    }
+  ],
+  "exits": [
+    {
+      "id": "north_exit",
+      "direction": "north",
+      "target_room": "center",
+      "target_entry": "from_south",
+      "type": "normal",
+      "success_message": "CENTER"
+    }
+  ]
+}

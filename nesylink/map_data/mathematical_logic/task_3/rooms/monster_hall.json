@@ -1,0 +1,48 @@
+{
+  "id": "monster_hall",
+  "coord": [-1, 0],
+  "layout": [
+    "..........",
+    "..........",
+    "..........",
+    "..........",
+    "..........",
+    "..........",
+    "..........",
+    ".........."
+  ],
+  "spawns": {
+    "default": [8, 4],
+    "from_east": [8, 4],
+    "from_west": [1, 4]
+  },
+  "default_spawn": "default",
+  "objects": [
+    {
+      "id": "hall_chaser",
+      "kind": "monster",
+      "pos": [5, 3],
+      "monster_type": "chaser",
+      "hp": 2,
+      "damage": 1
+    }
+  ],
+  "exits": [
+    {
+      "id": "east_exit",
+      "direction": "east",
+      "target_room": "start_room",
+      "target_entry": "from_west",
+      "type": "normal",
+      "success_message": "START ROOM"
+    },
+    {
+      "id": "west_exit",
+      "direction": "west",
+      "target_room": "key_room",
+      "target_entry": "from_east",
+      "type": "normal",
+      "success_message": "KEY ROOM"
+    }
+  ]
+}

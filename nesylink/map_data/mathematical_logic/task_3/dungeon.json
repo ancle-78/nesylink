@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "dungeon_id": "task_3",
+  "start_room": "start_room",
+  "room_files": [
+    "rooms/start_room.json",
+    "rooms/monster_hall.json",
+    "rooms/key_room.json"
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "id": "west",
+  "coord": [-1, 0],
+  "layout": [
+    "##########",
+    "#........#",
+    "#........#",
+    "..........",
+    "..........",
+    "#........#",
+    "#........#",
+    "##########"
+  ],
+  "spawns": {
+    "default": [7, 4],
+    "east_door": [8, 4]
+  },
+  "default_spawn": "default",
+  "objects": [
+    {
+      "id": "bridge_switch",
+      "kind": "switch",
+      "pos": [4, 4],
+      "activation": "interact",
+      "message": "BRIDGE TURN",
+      "effect": {
+        "type": "cycle_state",
+        "target": "center_bridge",
+        "order": ["west_to_north", "west_to_east", "west_to_south"]
+      }
+    }
+  ],
+  "exits": [
+    {
+      "id": "east_exit",
+      "direction": "east",
+      "target_room": "center",
+      "target_entry": "west_door",
+      "type": "normal",
+      "success_message": "CENTER"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "id": "room_001",
+  "coord": [0, 0],
+  "layout": [
+    "..........",
+    "..........",
+    "##..######",
+    "..........",
+    "..........",
+    "#######...",
+    "..........",
+    ".........."
+  ],
+  "spawns": {
+    "default": [4, 6],
+    "from_south": [4, 6]
+  },
+  "default_spawn": "default",
+  "objects": [
+    {"id": "chest_key", "kind": "chest", "pos": [0, 3], "loot": {"kind": "key", "key_id": "single_task_key"}}
+  ],
+  "exits": [
+    {
+      "id": "north_exit",
+      "direction": "north",
+      "target_room": "room_001",
+      "target_entry": "from_south",
+      "type": "locked_key",
+      "requires": {"key_count": 1, "consume_key": true},
+      "blocked_message": "NEED KEY",
+      "success_message": "CLEARED!",
+      "complete_task": true
+    }
+  ]
+}

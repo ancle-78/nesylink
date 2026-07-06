@@ -1,0 +1,49 @@
+{
+  "id": "start_room",
+  "coord": [0, 0],
+  "layout": [
+    "..........",
+    "..........",
+    "..........",
+    "..........",
+    "..........",
+    "..........",
+    "..........",
+    ".........."
+  ],
+  "spawns": {
+    "default": [4, 4],
+    "from_west": [1, 4],
+    "from_east": [8, 4]
+  },
+  "default_spawn": "default",
+  "objects": [
+    {
+      "id": "start_hint",
+      "kind": "npc",
+      "pos": [4, 1],
+      "text": "Find the key west, then return."
+    }
+  ],
+  "exits": [
+    {
+      "id": "west_exit",
+      "direction": "west",
+      "target_room": "monster_hall",
+      "target_entry": "from_east",
+      "type": "normal",
+      "success_message": "MONSTER HALL"
+    },
+    {
+      "id": "locked_right_exit",
+      "direction": "east",
+      "target_room": "start_room",
+      "target_entry": "from_east",
+      "type": "locked_key",
+      "requires": {"key_count": 1, "consume_key": true},
+      "blocked_message": "NEED KEY FROM WEST",
+      "success_message": "TASK CLEARED!",
+      "complete_task": true
+    }
+  ]
+}

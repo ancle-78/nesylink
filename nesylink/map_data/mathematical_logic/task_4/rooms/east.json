@@ -1,0 +1,42 @@
+{
+  "id": "east",
+  "coord": [1, 0],
+  "layout": [
+    "##########",
+    "#........#",
+    "#........#",
+    "..........",
+    "..........",
+    "#........#",
+    "#........#",
+    "##########"
+  ],
+  "spawns": {
+    "default": [1, 4],
+    "west_door": [1, 4]
+  },
+  "default_spawn": "default",
+  "objects": [
+    {
+      "id": "sword_chest",
+      "kind": "chest",
+      "pos": [5, 4],
+      "loot": {
+        "kind": "item",
+        "item_id": "sword",
+        "tool": "sword",
+        "equip_slot": "A"
+      }
+    }
+  ],
+  "exits": [
+    {
+      "id": "west_exit",
+      "direction": "west",
+      "target_room": "center",
+      "target_entry": "east_door",
+      "type": "normal",
+      "success_message": "CENTER"
+    }
+  ]
+}
