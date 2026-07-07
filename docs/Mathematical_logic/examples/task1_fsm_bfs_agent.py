@@ -70,7 +70,7 @@ ACTION_TO_DELTA = {
 }
 DELTA_TO_ACTION = {delta: action for action, delta in ACTION_TO_DELTA.items()}
 
-BLOCKING_KINDS = {
+BLOCKING_KINDS = { #默认不能走进去的格子
     "wall",
     "chest",
     "trap",
@@ -79,7 +79,7 @@ BLOCKING_KINDS = {
     "monster",
     "unknown",
 }
-SAFE_WALKABLE_KINDS = {
+SAFE_WALKABLE_KINDS = { #可以走的格子
     "floor",
     "player",
     "bridge",
@@ -92,7 +92,7 @@ SAFE_WALKABLE_KINDS = {
 
 
 @dataclass
-class FSMBFSAgent:
+class FSMBFSAgent: #核心类
     """基于像素识别、FSM、BFS、action mask 和 safety shield 的策略。
 
     评测器为了兼容会传入 ``info``。本策略只读取其中课程允许的显式物品栏视图，
@@ -100,12 +100,12 @@ class FSMBFSAgent:
     """
 
     phase: str = "to_chest"
-    queued_actions: deque[int] = field(default_factory=deque)
-    chest_interactions: int = 0
-    last_key_count: int = 0
-    key_confirmed: bool = False
-    exit_push_action: int | None = None
-    target_exit_tile: Position | None = None
+    queued_actions: deque[int] = field(default_factory=deque) #已经计划好但还没执行完的像素动作队列
+    chest_interactions: int = 0 #开箱交互次数记录
+    last_key_count: int = 0 #上一次看到的钥匙数量
+    key_confirmed: bool = False #是否确认已经拿到钥匙
+    exit_push_action: int | None = None #到达出口边界后，继续往房间外推的方向
+    target_exit_tile: Position | None = None #BFS 选中的出口 tile，防止玩家站上去后遮住出口图案
 
     def reset(self, seed: int | None = None, task_id: str | None = None) -> None:
         """在新 episode 开始前清空策略内部记忆。"""
@@ -122,10 +122,10 @@ class FSMBFSAgent:
     def act(self, obs, info=None) -> int:
         """根据像素观测和允许的物品栏信息输出一个环境动作。"""
 
-        self._update_inventory_progress(info)
-        vision = classify_frame(obs)
+        self._update_inventory_progress(info) #先读允许的 inventory 更新钥匙状态
+        vision = classify_frame(obs) #再从 obs 做视觉识别
         player = None if vision.player is None else vision.player.tile
-        if player is None:
+        if player is None: #如果看不到玩家，就等待
             return ACTION_NOOP
 
         self._update_phase(vision)
@@ -161,6 +161,7 @@ class FSMBFSAgent:
 
     def _act_to_chest(self, player: Position, vision: PixelObservation) -> int:
         """规划到可见宝箱旁边，并在相邻时执行交互。"""
+        # 从视觉结果里找所有宝箱
 
         chest_tiles = self._tiles_of_kind(vision, {"chest"})
         if not chest_tiles:
@@ -168,7 +169,7 @@ class FSMBFSAgent:
             return ACTION_NOOP
 
         adjacent = self._adjacent_targets(chest_tiles, vision)
-        if player in adjacent:
+        if player in adjacent: # 如果玩家已经在宝箱旁边
             chest = min(chest_tiles, key=lambda tile: manhattan(player, tile))
             face_action = action_toward(player, chest)
             if face_action is not None:
@@ -178,6 +179,7 @@ class FSMBFSAgent:
             self.chest_interactions += 1
             return ACTION_A
 
+        # 如果玩家不在宝箱旁边
         path = bfs_path(player, adjacent, vision)
         if len(path) >= 2:
             return self._start_tile_step(action_toward(path[0], path[1]))

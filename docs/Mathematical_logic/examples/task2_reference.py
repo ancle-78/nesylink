@@ -53,20 +53,21 @@ TASK2_TRAPS = {
 
 @dataclass(frozen=True)
 class SymbolicState:
-    player: Position
-    exits: set[Position]
-    walls: set[Position]
-    traps: set[Position]
-    monsters: set[Position]
-    chests: set[Position]
-    health: int
-    keys: int
-    first_monster_hit: bool
+    player: Position #玩家位置
+    exits: set[Position] #出口集合
+    walls: set[Position] #墙集合
+    traps: set[Position] #陷阱集合
+    monsters: set[Position] #怪物集合
+    chests: set[Position] #宝箱集合
+    health: int #生命值
+    keys: int #钥匙数量
+    first_monster_hit: bool #怪物是否已被第一次击中
 
 
+# 状态抽取函数，从info里面读
 def extract_symbolic_state(info: dict, *, first_monster_hit: bool) -> SymbolicState:
     entities = info.get("entities", {})
-    inventory = info.get("inventory", {})
+    inventory = info.get("inventory", {})# 背包状态/物品栏
     agent = info.get("agent", {})
     player = tuple(int(value) for value in agent.get("tile", (0, 0)))
     monsters_remaining = int(entities.get("monsters_remaining", 0))
