@@ -99,16 +99,16 @@ class Task2FSMBFSAgent:
     不读取对象坐标、地图真值、debug 字段、entities 字段或 room id。
     """
 
-    phase: str = "to_monster"
-    queued_actions: deque[int] = field(default_factory=deque)
-    last_key_count: int = 0
+    phase: str = "to_monster" # 当前任务阶段：to_monster / to_chest / to_exit
+    queued_actions: deque[int] = field(default_factory=deque) # 像素级动作缓存。BFS 规划的是 tile 级一步，但环境是 pixel 级移动，所以需要缓存一些连续动作。
+    last_key_count: int = 0 # 通过允许的 inventory 判断是否拿到钥匙
     key_confirmed: bool = False
     monster_missing_frames: int = 0
-    monster_cleared: bool = False
-    remembered_chest_tiles: set[Position] = field(default_factory=set)
-    target_exit_tile: Position | None = None
+    monster_cleared: bool = False # 连续几帧看不到怪物后，才认为怪物已清除
+    remembered_chest_tiles: set[Position] = field(default_factory=set) # 从历史视觉中记住曾经看见过宝箱的位置，避免开箱后贴着宝箱发生像素碰撞堵塞
+    target_exit_tile: Position | None = None # 到达边界出口后，记住出口格和推出方向
     exit_push_action: int | None = None
-    last_move_action: int | None = None
+    last_move_action: int | None = None # 记录上一帧移动方向，用于判断是否已经面向怪物
 
     def reset(self, seed: int | None = None, task_id: str | None = None) -> None:
         """在新 episode 开始前清空策略内部记忆。"""
