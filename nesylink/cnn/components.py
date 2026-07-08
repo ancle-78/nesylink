@@ -34,6 +34,20 @@ DYNAMIC_CLASS_TO_ID = {name: idx for idx, name in enumerate(DYNAMIC_CLASSES)}
 CLASS_TO_ID = {name: idx for idx, name in enumerate(COMPONENT_CLASSES)}
 ID_TO_CLASS = {idx: name for name, idx in CLASS_TO_ID.items()}
 
+SPLIT_TILE_COMPONENT_KINDS = (
+    "wall",
+    "player",
+    "chest",
+    "monster",
+    "trap",
+    "button",
+    "switch",
+    "gap",
+    "bridge",
+    "npc",
+    "unknown",
+)
+
 COLORS = {
     "player": (30, 255, 80),
     "wall": (255, 40, 90),
@@ -99,10 +113,7 @@ def labels_from_room_json(payload: dict[str, Any]) -> np.ndarray:
     for obj in payload.get("objects", []):
         if not isinstance(obj, dict):
             continue
-        kind = str(obj.get("kind", "unknown"))
-        pos = obj.get("pos")
-        if kind in CLASS_TO_ID and valid_tile(pos):
-            labels[int(pos[1]), int(pos[0])] = CLASS_TO_ID[kind]
+        write_object_label(labels, obj)
 
     spawns = payload.get("spawns", {})
     default_spawn = str(payload.get("default_spawn", "default"))
@@ -191,7 +202,7 @@ def dynamic_target_from_tile(kind: str, tile: tuple[int, int]) -> DynamicTarget:
 
 def exit_class_from_config(exit_cfg: dict[str, Any]) -> str:
     exit_type = str(exit_cfg.get("type", "normal"))
-    if exit_type == "locked_key" or "requires" in exit_cfg:
+    if exit_type in {"locked_key", "conditional"} or "requires" in exit_cfg:
         return "exit_locked"
     return "exit_normal"
 
@@ -232,6 +243,62 @@ def dynamic_heatmap_targets(
     return heatmap, box, mask
 
 
+def write_object_label(labels: np.ndarray, obj: dict[str, Any]) -> None:
+    kind = str(obj.get("kind", "unknown"))
+    if kind not in CLASS_TO_ID:
+        return
+    if kind == "chest" and bool(obj.get("hidden", False)):
+        return
+    if kind == "trap":
+        for x, y in trap_tiles_from_object(obj):
+            if ID_TO_CLASS.get(int(labels[y, x])) == "bridge":
+                continue
+            labels[y, x] = CLASS_TO_ID[kind]
+        return
+    pos = obj.get("pos")
+    if valid_tile(pos):
+        labels[int(pos[1]), int(pos[0])] = CLASS_TO_ID[kind]
+
+
+def trap_tiles_from_object(obj: dict[str, Any]) -> list[tuple[int, int]]:
+    tiles: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+
+    pos = obj.get("pos")
+    if valid_tile(pos):
+        tile = (int(pos[0]), int(pos[1]))
+        tiles.append(tile)
+        seen.add(tile)
+
+    raw_tiles = obj.get("tiles", [])
+    if isinstance(raw_tiles, list):
+        for raw_tile in raw_tiles:
+            if valid_tile(raw_tile):
+                tile = (int(raw_tile[0]), int(raw_tile[1]))
+                if tile not in seen:
+                    tiles.append(tile)
+                    seen.add(tile)
+
+    raw_rects = obj.get("rects", [])
+    if isinstance(raw_rects, list):
+        for raw_rect in raw_rects:
+            if not isinstance(raw_rect, dict):
+                continue
+            start = raw_rect.get("from")
+            end = raw_rect.get("to")
+            if not valid_tile(start) or not valid_tile(end):
+                continue
+            min_x, max_x = sorted((int(start[0]), int(end[0])))
+            min_y, max_y = sorted((int(start[1]), int(end[1])))
+            for y in range(min_y, max_y + 1):
+                for x in range(min_x, max_x + 1):
+                    tile = (x, y)
+                    if tile not in seen:
+                        tiles.append(tile)
+                        seen.add(tile)
+    return tiles
+
+
 def write_dynamic_object_labels(labels: np.ndarray, obj: dict[str, Any]) -> None:
     states = obj.get("states", {})
     if not isinstance(states, dict):
@@ -260,11 +327,18 @@ def component_boxes_from_class_grid(
     *,
     score_grid: Sequence[Sequence[float]] | np.ndarray | None = None,
     ignored: Iterable[str] = ("floor",),
+    split_tile_kinds: Iterable[str] = SPLIT_TILE_COMPONENT_KINDS,
 ) -> list[ComponentBox]:
-    """Merge adjacent same-class tiles into component boxes."""
+    """Convert a class grid into boxes.
+
+    Static map objects are kept as one box per grid cell so navigation can use
+    exact tile occupancy. The only static classes merged by default are the
+    two-tile door classes: exit_normal and exit_locked.
+    """
     grid = normalize_class_grid(class_grid)
     scores = None if score_grid is None else np.asarray(score_grid, dtype=np.float32)
     ignored_set = set(ignored)
+    split_set = set(split_tile_kinds)
     seen = np.zeros(grid.shape, dtype=bool)
     boxes: list[ComponentBox] = []
 
@@ -275,6 +349,10 @@ def component_boxes_from_class_grid(
             kind = ID_TO_CLASS.get(int(grid[y, x]), "unknown")
             if kind in ignored_set:
                 seen[y, x] = True
+                continue
+            if kind in split_set:
+                seen[y, x] = True
+                boxes.append(make_component_box(kind, ((x, y),), scores))
                 continue
             tiles = flood_fill_same_kind(grid, seen, (x, y), int(grid[y, x]))
             boxes.append(make_component_box(kind, tiles, scores))

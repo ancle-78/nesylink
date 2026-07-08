@@ -16,7 +16,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 CNN_DIR = Path(__file__).resolve().parent
 
-from nesylink.cnn.annotate_scene import collect_labels, collect_pixel_labels, draw_box, draw_pixel_box
+from nesylink.cnn.annotate_scene import collect_component_boxes
+from nesylink.cnn.components import draw_component_boxes
 from nesylink.cnn.generate_synthetic_scene import apply_player_offset, build_synthetic_room, write_player_pixel_annotation
 from nesylink.core.constants import MAP_PIXEL_HEIGHT, MAP_PIXEL_WIDTH
 from nesylink.core.rendering import render_frame
@@ -122,12 +123,8 @@ def generate_one(
 def annotate_one(image_path: Path, json_path: Path, out_path: Path, *, labels: bool) -> None:
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     image = Image.open(image_path).convert("RGB")
-    draw = ImageDraw.Draw(image)
-    for item in collect_labels(payload):
-        draw_box(draw, item, labels=labels)
-    for item in collect_pixel_labels(payload):
-        draw_pixel_box(draw, item, labels=labels)
-    image.save(out_path)
+    annotated = draw_component_boxes(image, collect_component_boxes(payload), labels=labels)
+    annotated.save(out_path)
 
 
 def player_offset_for_index(index: int) -> tuple[int, int]:

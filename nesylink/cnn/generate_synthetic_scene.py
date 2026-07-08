@@ -127,11 +127,12 @@ def build_synthetic_room(rng: random.Random) -> dict[str, Any]:
     objects: list[dict[str, Any]] = []
     occupied = set(blocked) | reserved
     add_chests(rng, objects, occupied, count=rng.randint(1, 3))
+    add_npcs(rng, objects, occupied, count=rng.randint(1, 2))
     add_monsters(rng, objects, occupied, count=rng.randint(1, 3))
     add_traps(rng, objects, occupied, count=rng.randint(2, 5))
     add_buttons_and_switches(rng, objects, occupied, enabled=bool(dynamic_objects))
 
-    exit_type = rng.choice(["normal", "locked_key"])
+    exit_type = rng.choice(["normal", "locked_key", "conditional"])
     exit_config: dict[str, Any] = {
         "id": f"{exit_direction}_exit",
         "direction": exit_direction,
@@ -144,6 +145,9 @@ def build_synthetic_room(rng: random.Random) -> dict[str, Any]:
     }
     if exit_type == "locked_key":
         exit_config["requires"] = {"key_count": 1, "consume_key": False}
+    elif exit_type == "conditional":
+        exit_config["requires"] = {"all_monsters_defeated": True}
+        exit_config["blocked_message"] = "CONDITION LOCKED"
 
     return {
         "id": "synthetic_room",
@@ -181,6 +185,26 @@ def add_chests(
             }
         )
 
+
+
+def add_npcs(
+    rng: random.Random,
+    objects: list[dict[str, Any]],
+    blocked: set[tuple[int, int]],
+    *,
+    count: int,
+) -> None:
+    for index in range(count):
+        pos = choose_free_tile(rng, blocked, margin=True)
+        blocked.add(pos)
+        objects.append(
+            {
+                "id": f"npc_{index}",
+                "kind": "npc",
+                "pos": [pos[0], pos[1]],
+                "text": rng.choice(["HELLO", "GUIDE", "TRADE", "CLUE"]),
+            }
+        )
 
 def add_monsters(
     rng: random.Random,

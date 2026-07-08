@@ -8,6 +8,14 @@ from typing import Any
 
 from PIL import Image, ImageDraw
 
+from nesylink.cnn.components import (
+    ComponentBox,
+    component_boxes_from_class_grid,
+    draw_component_boxes,
+    dynamic_targets_from_room_json,
+    static_labels_from_room_json,
+)
+
 
 TILE_SIZE = 16
 GRID_WIDTH = 10
@@ -31,6 +39,9 @@ COLORS = {
     "gap": (20, 25, 70),
     "bridge": (190, 115, 45),
     "exit": (255, 245, 80),
+    "exit_normal": (255, 245, 80),
+    "exit_locked": (96, 48, 26),
+    "npc": (240, 154, 52),
 }
 
 
@@ -63,16 +74,31 @@ def main() -> None:
     payload = json.loads(args.json.read_text(encoding="utf-8"))
 
     image = Image.open(args.image).convert("RGB")
-    draw = ImageDraw.Draw(image)
-    for item in collect_labels(payload):
-        draw_box(draw, item, labels=args.labels)
-    for item in collect_pixel_labels(payload):
-        draw_pixel_box(draw, item, labels=args.labels)
+    annotated = draw_component_boxes(image, collect_component_boxes(payload), labels=args.labels)
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    image.save(out)
+    annotated.save(out)
     print(f"saved {out}")
 
+
+
+def collect_component_boxes(payload: dict[str, Any]) -> list[ComponentBox]:
+    boxes = component_boxes_from_class_grid(static_labels_from_room_json(payload))
+    for target in dynamic_targets_from_room_json(payload):
+        boxes.append(
+            ComponentBox(
+                kind=target.kind,
+                tiles=(pixel_to_tile(target.center_px),),
+                bbox_px=target.bbox_px,
+                score=1.0,
+            )
+        )
+    return boxes
+
+
+def pixel_to_tile(center_px: tuple[float, float]) -> tuple[int, int]:
+    x, y = center_px
+    return min(GRID_WIDTH - 1, max(0, int(x // TILE_SIZE))), min(GRID_HEIGHT - 1, max(0, int(y // TILE_SIZE)))
 
 def collect_labels(payload: dict[str, Any]) -> list[BoxLabel]:
     labels: list[BoxLabel] = []
@@ -166,10 +192,18 @@ def exit_labels(payload: dict[str, Any]) -> list[BoxLabel]:
         if not isinstance(exit_cfg, dict):
             continue
         direction = str(exit_cfg.get("direction", ""))
-        exit_type = str(exit_cfg.get("type", "exit"))
+        kind = exit_class_from_config(exit_cfg)
+        label = "locked" if kind == "exit_locked" else "normal"
         for tile in EXIT_TILES.get(direction, []):
-            labels.append(BoxLabel(kind="exit", tile=tile, label=exit_type))
+            labels.append(BoxLabel(kind=kind, tile=tile, label=label))
     return labels
+
+
+def exit_class_from_config(exit_cfg: dict[str, Any]) -> str:
+    exit_type = str(exit_cfg.get("type", "normal"))
+    if exit_type in {"locked_key", "conditional"} or "requires" in exit_cfg:
+        return "exit_locked"
+    return "exit_normal"
 
 
 def dedupe_labels(labels: list[BoxLabel]) -> list[BoxLabel]:
