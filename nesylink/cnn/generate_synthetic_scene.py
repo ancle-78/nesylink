@@ -81,7 +81,8 @@ def main() -> None:
         player = PlayerState(position_px=tile_to_top_left_px(room.spawns[room.default_spawn_name]))
         player.facing = player_facing_from_payload(payload)
         apply_player_offset(player, tuple(args.player_offset_px))
-        write_player_pixel_annotation(payload, player)
+        apply_monster_offsets(room, args.seed)
+        write_runtime_pixel_annotations(payload, player, room)
         frame = render_frame(room, player)
 
     image = frame if args.full_frame else frame[:MAP_PIXEL_HEIGHT, :MAP_PIXEL_WIDTH]
@@ -109,25 +110,74 @@ def apply_player_offset(player: PlayerState, offset_px: tuple[int, int]) -> None
     )
 
 
+def apply_monster_offsets(room: Any, index: int) -> None:
+    for monster_index, monster in enumerate(room.monsters.values()):
+        dx, dy = monster_offset_for_index(index + monster_index * 13)
+        x, y = monster.position_px
+        max_x = MAP_PIXEL_WIDTH - monster.size_px
+        max_y = MAP_PIXEL_HEIGHT - monster.size_px
+        monster.position_px = (
+            float(max(0, min(max_x, x + dx))),
+            float(max(0, min(max_y, y + dy))),
+        )
+
+
+def monster_offset_for_index(index: int) -> tuple[int, int]:
+    offsets = (
+        (0, 0),
+        (-6, 0),
+        (6, 0),
+        (0, -6),
+        (0, 6),
+        (-4, -4),
+        (4, -4),
+        (-4, 4),
+        (4, 4),
+        (-7, 2),
+        (7, -2),
+        (2, 7),
+        (-2, -7),
+    )
+    return offsets[index % len(offsets)]
+
+
 def write_player_pixel_annotation(payload: dict[str, Any], player: PlayerState) -> None:
-    left = int(round(player.position_px[0]))
-    top = int(round(player.position_px[1]))
-    right = left + int(player.size_px)
-    bottom = top + int(player.size_px)
+    write_runtime_pixel_annotations(payload, player)
+
+
+def write_runtime_pixel_annotations(payload: dict[str, Any], player: PlayerState, room: Any | None = None) -> None:
+    boxes = [dynamic_pixel_box("player", "player_px", player.position_px, int(player.size_px))]
+    if room is not None:
+        for monster in room.monsters.values():
+            boxes.append(
+                dynamic_pixel_box(
+                    "monster",
+                    f"monster_{monster.monster_type}",
+                    monster.position_px,
+                    int(monster.size_px),
+                )
+            )
+
     annotations = payload.get("annotations", {})
     if not isinstance(annotations, dict):
         annotations = {}
     else:
         annotations = dict(annotations)
-    annotations["pixel_boxes"] = [
-        {
-            "kind": "player",
-            "label": "player_px",
-            "bbox_px": [left, top, right, bottom],
-            "center_px": [(left + right) * 0.5, (top + bottom) * 0.5],
-        }
-    ]
+    annotations["pixel_boxes"] = boxes
     payload["annotations"] = annotations
+
+
+def dynamic_pixel_box(kind: str, label: str, position_px: tuple[float, float], size_px: int) -> dict[str, Any]:
+    left = int(round(position_px[0]))
+    top = int(round(position_px[1]))
+    right = left + int(size_px)
+    bottom = top + int(size_px)
+    return {
+        "kind": kind,
+        "label": label,
+        "bbox_px": [left, top, right, bottom],
+        "center_px": [(left + right) * 0.5, (top + bottom) * 0.5],
+    }
 
 
 def build_synthetic_room(

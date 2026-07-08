@@ -19,13 +19,14 @@ CNN_DIR = Path(__file__).resolve().parent
 from nesylink.cnn.annotate_scene import collect_component_boxes
 from nesylink.cnn.components import draw_component_boxes
 from nesylink.cnn.generate_synthetic_scene import (
+    apply_monster_offsets,
     apply_player_offset,
     build_synthetic_room,
     player_context_for_index,
     player_facing_for_index,
     player_facing_from_payload,
     scene_style_for_index,
-    write_player_pixel_annotation,
+    write_runtime_pixel_annotations,
 )
 from nesylink.core.constants import MAP_PIXEL_HEIGHT, MAP_PIXEL_WIDTH
 from nesylink.core.rendering import render_frame
@@ -141,7 +142,8 @@ def generate_one(
         player = PlayerState(position_px=tile_to_top_left_px(room.spawns[room.default_spawn_name]))
         player.facing = player_facing_from_payload(payload)
         apply_player_offset(player, player_offset_px)
-        write_player_pixel_annotation(payload, player)
+        apply_monster_offsets(room, seed)
+        write_runtime_pixel_annotations(payload, player, room)
         frame = render_frame(room, player)
 
     image = frame[:MAP_PIXEL_HEIGHT, :MAP_PIXEL_WIDTH]

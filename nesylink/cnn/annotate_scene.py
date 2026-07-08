@@ -34,6 +34,7 @@ COLORS = {
     "chest": (180, 95, 35),
     "monster": (255, 145, 20),
     "trap": (170, 170, 190),
+    "abyss": (30, 30, 42),
     "button": (40, 210, 90),
     "switch": (255, 225, 40),
     "gap": (20, 25, 70),
@@ -41,6 +42,7 @@ COLORS = {
     "exit": (255, 245, 80),
     "exit_normal": (255, 245, 80),
     "exit_locked": (96, 48, 26),
+    "exit_conditional": (70, 220, 180),
     "npc": (240, 154, 52),
 }
 
@@ -141,13 +143,13 @@ def object_labels(payload: dict[str, Any]) -> list[BoxLabel]:
             continue
         kind = str(obj.get("kind", "unknown"))
         pos = obj.get("pos")
+        if kind == "trap":
+            kind = trap_class_from_object(obj)
         if kind not in COLORS or not valid_pos(pos):
             continue
         label = kind
         if kind == "monster":
             label = str(obj.get("monster_type", "monster"))
-        if kind == "trap":
-            label = str(obj.get("trap_type", "trap"))
         labels.append(BoxLabel(kind=kind, tile=(int(pos[0]), int(pos[1])), label=label))
     return labels
 
@@ -193,7 +195,10 @@ def exit_labels(payload: dict[str, Any]) -> list[BoxLabel]:
             continue
         direction = str(exit_cfg.get("direction", ""))
         kind = exit_class_from_config(exit_cfg)
-        label = "locked" if kind == "exit_locked" else "normal"
+        label = {
+            "exit_locked": "locked",
+            "exit_conditional": "cond",
+        }.get(kind, "normal")
         for tile in EXIT_TILES.get(direction, []):
             labels.append(BoxLabel(kind=kind, tile=tile, label=label))
     return labels
@@ -201,9 +206,15 @@ def exit_labels(payload: dict[str, Any]) -> list[BoxLabel]:
 
 def exit_class_from_config(exit_cfg: dict[str, Any]) -> str:
     exit_type = str(exit_cfg.get("type", "normal"))
-    if exit_type in {"locked_key", "conditional"} or "requires" in exit_cfg:
+    if exit_type == "conditional":
+        return "exit_conditional"
+    if exit_type == "locked_key" or "key_count" in exit_cfg.get("requires", {}):
         return "exit_locked"
     return "exit_normal"
+
+
+def trap_class_from_object(obj: dict[str, Any]) -> str:
+    return "abyss" if str(obj.get("trap_type", obj.get("type", "spike"))).lower() == "abyss" else "trap"
 
 
 def dedupe_labels(labels: list[BoxLabel]) -> list[BoxLabel]:

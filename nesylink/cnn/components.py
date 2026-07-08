@@ -20,12 +20,14 @@ COMPONENT_CLASSES = (
     "chest",
     "monster",
     "trap",
+    "abyss",
     "button",
     "switch",
     "gap",
     "bridge",
     "exit_normal",
     "exit_locked",
+    "exit_conditional",
     "npc",
     "unknown",
 )
@@ -40,6 +42,7 @@ SPLIT_TILE_COMPONENT_KINDS = (
     "chest",
     "monster",
     "trap",
+    "abyss",
     "button",
     "switch",
     "gap",
@@ -54,12 +57,14 @@ COLORS = {
     "chest": (180, 95, 35),
     "monster": (255, 145, 20),
     "trap": (170, 170, 190),
+    "abyss": (30, 30, 42),
     "button": (40, 210, 90),
     "switch": (255, 225, 40),
     "gap": (20, 25, 70),
     "bridge": (190, 115, 45),
     "exit_normal": (255, 245, 80),
     "exit_locked": (96, 48, 26),
+    "exit_conditional": (70, 220, 180),
     "npc": (240, 154, 52),
     "unknown": (255, 255, 255),
 }
@@ -179,12 +184,13 @@ def dynamic_targets_from_room_json(payload: dict[str, Any]) -> list[DynamicTarge
         x, y = spawns[default_spawn]
         targets.append(dynamic_target_from_tile("player", (int(x), int(y))))
 
-    for obj in payload.get("objects", []):
-        if not isinstance(obj, dict) or str(obj.get("kind")) != "monster":
-            continue
-        pos = obj.get("pos")
-        if valid_tile(pos):
-            targets.append(dynamic_target_from_tile("monster", (int(pos[0]), int(pos[1]))))
+    if "monster" not in annotated_kinds:
+        for obj in payload.get("objects", []):
+            if not isinstance(obj, dict) or str(obj.get("kind")) != "monster":
+                continue
+            pos = obj.get("pos")
+            if valid_tile(pos):
+                targets.append(dynamic_target_from_tile("monster", (int(pos[0]), int(pos[1]))))
     return targets
 
 
@@ -231,7 +237,9 @@ def dynamic_target_from_tile(kind: str, tile: tuple[int, int]) -> DynamicTarget:
 
 def exit_class_from_config(exit_cfg: dict[str, Any]) -> str:
     exit_type = str(exit_cfg.get("type", "normal"))
-    if exit_type in {"locked_key", "conditional"} or "requires" in exit_cfg:
+    if exit_type == "conditional":
+        return "exit_conditional"
+    if exit_type == "locked_key" or "key_count" in exit_cfg.get("requires", {}):
         return "exit_locked"
     return "exit_normal"
 
@@ -279,15 +287,20 @@ def write_object_label(labels: np.ndarray, obj: dict[str, Any]) -> None:
     if kind == "chest" and bool(obj.get("hidden", False)):
         return
     if kind == "trap":
+        trap_class = trap_class_from_object(obj)
         for x, y in trap_tiles_from_object(obj):
             if ID_TO_CLASS.get(int(labels[y, x])) == "bridge":
                 continue
-            labels[y, x] = CLASS_TO_ID[kind]
+            labels[y, x] = CLASS_TO_ID[trap_class]
         return
     pos = obj.get("pos")
     if valid_tile(pos):
         labels[int(pos[1]), int(pos[0])] = CLASS_TO_ID[kind]
 
+
+
+def trap_class_from_object(obj: dict[str, Any]) -> str:
+    return "abyss" if str(obj.get("trap_type", obj.get("type", "spike"))).lower() == "abyss" else "trap"
 
 def trap_tiles_from_object(obj: dict[str, Any]) -> list[tuple[int, int]]:
     tiles: list[tuple[int, int]] = []
