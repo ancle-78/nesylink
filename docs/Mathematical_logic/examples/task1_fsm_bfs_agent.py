@@ -8,8 +8,9 @@ from __future__ import annotations
    代码不会读取地图真值、对象真实坐标、房间编号、debug 状态、entities 等
    隐藏环境信息。当前评测接口把允许使用的物品栏放在 ``info["inventory"]``
    中，因此本策略只从里面取 ``inventory["keys"]``，其余 ``info`` 字段一律不用。
-2. 先用 ``classify_frame`` 把像素图转成符号 tile 网格，识别玩家、宝箱、墙、
-   出口、陷阱、地板等类别。
+2. 先用 ``classify_frame_cnn`` 把像素图转成符号 tile 网格，识别玩家、宝箱、
+   墙、出口、陷阱、地板等类别。本文件现在使用 CNN-only perception，不回退
+   传统颜色分类器。
 3. 使用一个很小的有限状态机：
       ``to_chest`` -> 先走到可见宝箱旁边并交互；
       ``to_exit``  -> 确认钥匙数量增加后，再走到可见边界出口并推出房间。
@@ -20,6 +21,9 @@ from __future__ import annotations
 6. 新规划出的移动动作会经过 safety shield。它会阻止主动走进墙、未打开宝箱、
    陷阱、gap、怪物或 unknown tile。唯一允许越出地图边界的情况，是已经确认
    玩家位于边界出口格，需要继续向外推门。
+7. 策略会把图像中见过的墙和宝箱记为静态阻挡物。这样即使宝箱打开后外观变化、
+   CNN 不再把它判成 ``chest``，BFS 也不会尝试从宝箱格穿过去。这个记忆仍然只
+   来自图像识别结果，不来自环境地图真值。
 
 针对前面检查出的几个问题，这里做了约束：
 
@@ -31,6 +35,8 @@ from __future__ import annotations
   或位置偏移而盲目走下去。
 - 当玩家站在出口格上时，玩家 sprite 可能遮住出口图案，所以代码会记住 BFS
   选中的目标出口格；只要玩家仍在这个记住的边界格上，就允许最后向外推进。
+- 打开后的宝箱可能被 CNN 识别成 floor 或 exit，但环境中宝箱仍是阻挡物。当前
+  代码会记住曾经看见或交互过的宝箱格，把它持续作为 BFS 阻挡。
 - 这个策略仍然是面向 task1 的简单策略，默认环境是单房间、静态的“拿钥匙后
   出门”任务。如果用于有动态怪物或会变化陷阱的任务，需要更频繁地重检队列中
   的像素移动动作。
@@ -56,7 +62,7 @@ from nesylink.core.constants import (
     GRID_WIDTH,
     TILE_SIZE,
 )
-from nesylink.vision import PixelObservation, classify_frame
+from nesylink.vision import PixelObservation, classify_frame_cnn
 
 
 Position = tuple[int, int]
@@ -106,6 +112,8 @@ class FSMBFSAgent:
     key_confirmed: bool = False
     exit_push_action: int | None = None
     target_exit_tile: Position | None = None
+    queued_target_tile: Position | None = None
+    remembered_blockers: set[Position] = field(default_factory=set)
 
     def reset(self, seed: int | None = None, task_id: str | None = None) -> None:
         """在新 episode 开始前清空策略内部记忆。"""
@@ -118,20 +126,30 @@ class FSMBFSAgent:
         self.key_confirmed = False
         self.exit_push_action = None
         self.target_exit_tile = None
+        self.queued_target_tile = None
+        self.remembered_blockers.clear()
 
     def act(self, obs, info=None) -> int:
         """根据像素观测和允许的物品栏信息输出一个环境动作。"""
 
         self._update_inventory_progress(info)
-        vision = classify_frame(obs)
+        vision = classify_frame_cnn(obs, fallback=False)
         player = None if vision.player is None else vision.player.tile
         if player is None:
             return ACTION_NOOP
 
+        self._remember_static_blockers(vision)
         self._update_phase(vision)
 
         if self.queued_actions:
-            return self.queued_actions.popleft()
+            queued_action = self.queued_actions.popleft()
+            shielded_action = self._shield_queued_action(queued_action, vision)
+            if shielded_action != queued_action:
+                self.queued_actions.clear()
+                self.queued_target_tile = None
+            elif not self.queued_actions:
+                self.queued_target_tile = None
+            return shielded_action
 
         if self.phase == "to_chest":
             action = self._act_to_chest(player, vision)
@@ -170,6 +188,7 @@ class FSMBFSAgent:
         adjacent = self._adjacent_targets(chest_tiles, vision)
         if player in adjacent:
             chest = min(chest_tiles, key=lambda tile: manhattan(player, tile))
+            self.remembered_blockers.add(chest)
             face_action = action_toward(player, chest)
             if face_action is not None:
                 self.queued_actions.append(ACTION_A)
@@ -178,25 +197,26 @@ class FSMBFSAgent:
             self.chest_interactions += 1
             return ACTION_A
 
-        path = bfs_path(player, adjacent, vision)
+        path = bfs_path(player, adjacent, vision, self.remembered_blockers)
         if len(path) >= 2:
-            return self._start_tile_step(action_toward(path[0], path[1]))
+            return self._start_tile_step(action_toward(path[0], path[1]), path[1])
         return ACTION_NOOP
 
     def _act_to_exit(self, player: Position, vision: PixelObservation) -> int:
         """规划到可见出口，并在边界出口格上继续向外推进。"""
 
-        exit_tiles = self._tiles_of_kind(vision, {"exit_locked", "exit_normal"})
-        reachable_exit_tiles = {tile for tile in exit_tiles if is_walkable(tile, vision)}
+        exit_tiles = {
+            tile
+            for tile in self._tiles_of_kind(vision, {"exit_locked", "exit_normal"})
+            if is_structural_exit_tile(tile, vision)
+        }
+        reachable_exit_tiles = {tile for tile in exit_tiles if self._is_walkable(tile, vision)}
 
         if self.exit_push_action is not None:
             if self._can_continue_exit_push(player, reachable_exit_tiles):
                 return self.exit_push_action
             self.exit_push_action = None
             self.target_exit_tile = None
-
-        if not reachable_exit_tiles:
-            return ACTION_NOOP
 
         if player in reachable_exit_tiles or (
             self.target_exit_tile is not None
@@ -207,10 +227,13 @@ class FSMBFSAgent:
             self.target_exit_tile = player
             return self.exit_push_action or ACTION_NOOP
 
-        path = bfs_path(player, reachable_exit_tiles, vision)
+        if not reachable_exit_tiles:
+            return ACTION_NOOP
+
+        path = bfs_path(player, reachable_exit_tiles, vision, self.remembered_blockers)
         if len(path) >= 2:
             self.target_exit_tile = path[-1]
-            return self._start_tile_step(action_toward(path[0], path[1]))
+            return self._start_tile_step(action_toward(path[0], path[1]), path[1])
         return ACTION_NOOP
 
     def _can_continue_exit_push(self, player: Position, reachable_exit_tiles: set[Position]) -> bool:
@@ -224,12 +247,38 @@ class FSMBFSAgent:
             and (player in reachable_exit_tiles or player == self.target_exit_tile)
         )
 
-    def _start_tile_step(self, action: int | None) -> int:
+    def _start_tile_step(self, action: int | None, target_tile: Position | None) -> int:
         """把 BFS 的一格移动展开成若干个像素级重复动作。"""
 
         if action is None:
             return ACTION_NOOP
+        self.queued_target_tile = target_tile
         self.queued_actions.extend([action] * (TILE_SIZE - 1))
+        return action
+
+    def _shield_queued_action(self, action: int, vision: PixelObservation) -> int:
+        """检查像素级连续移动是否仍然朝着原本的 BFS 目标格前进。
+
+        队列中的动作是“一格 tile 移动”拆成的后续像素帧。这里不能直接调用
+        ``_shield_action``，因为玩家还没完全走完整格时，tile 识别可能已经切到
+        目标格；如果此时再检查 ``next_position(player, action)``，就会误以为
+        策略要继续走到下一格，从而提前打断正常移动。
+        """
+
+        if action not in MOVE_ACTIONS:
+            return action
+        if vision.player is None:
+            return ACTION_NOOP
+        if self.queued_target_tile is None:
+            return self._shield_action(action, vision)
+
+        player = vision.player.tile
+        if manhattan(player, self.queued_target_tile) > 1:
+            return ACTION_NOOP
+        if player == self.queued_target_tile:
+            return action
+        if not self._is_walkable(self.queued_target_tile, vision):
+            return ACTION_NOOP
         return action
 
     def _shield_action(self, action: int, vision: PixelObservation) -> int:
@@ -263,7 +312,7 @@ class FSMBFSAgent:
             return ACTION_NOOP
         if self.phase == "to_chest" and vision.grid[nxt[1]][nxt[0]] == "chest":
             return action
-        if not is_walkable(nxt, vision):
+        if not self._is_walkable(nxt, vision):
             return ACTION_NOOP
         return action
 
@@ -272,18 +321,33 @@ class FSMBFSAgent:
 
         return {tile.tile for tile in vision.tiles if tile.kind in kinds}
 
+    def _remember_static_blockers(self, vision: PixelObservation) -> None:
+        """记住从图像中看到的稳定阻挡物。"""
+
+        self.remembered_blockers.update(self._tiles_of_kind(vision, {"wall", "chest"}))
+
+    def _is_walkable(self, pos: Position, vision: PixelObservation) -> bool:
+        """结合当前视觉和静态阻挡记忆判断某格是否可走。"""
+
+        return is_walkable(pos, vision, self.remembered_blockers)
+
     def _adjacent_targets(self, blocked_targets: set[Position], vision: PixelObservation) -> set[Position]:
         """返回阻挡型交互目标旁边所有可站立的 tile。"""
 
         out: set[Position] = set()
         for target in blocked_targets:
             for pos in neighbors(target):
-                if in_bounds(pos) and is_walkable(pos, vision):
+                if in_bounds(pos) and self._is_walkable(pos, vision):
                     out.add(pos)
         return out
 
 
-def bfs_path(start: Position, goals: set[Position], vision: PixelObservation) -> list[Position]:
+def bfs_path(
+    start: Position,
+    goals: set[Position],
+    vision: PixelObservation,
+    remembered_blockers: set[Position] | frozenset[Position] = frozenset(),
+) -> list[Position]:
     """用 BFS 找到从 ``start`` 到任一目标 tile 的最短符号路径。"""
 
     if start in goals:
@@ -296,7 +360,7 @@ def bfs_path(start: Position, goals: set[Position], vision: PixelObservation) ->
         for nxt in neighbors(current):
             if nxt in parent:
                 continue
-            if nxt not in goals and not is_walkable(nxt, vision):
+            if nxt not in goals and not is_walkable(nxt, vision, remembered_blockers):
                 continue
             if not in_bounds(nxt):
                 continue
@@ -319,10 +383,16 @@ def reconstruct_path(parent: dict[Position, Position | None], goal: Position) ->
     return path
 
 
-def is_walkable(pos: Position, vision: PixelObservation) -> bool:
+def is_walkable(
+    pos: Position,
+    vision: PixelObservation,
+    remembered_blockers: set[Position] | frozenset[Position] = frozenset(),
+) -> bool:
     """判断某个符号 tile 是否适合普通移动进入。"""
 
     if not in_bounds(pos):
+        return False
+    if pos in remembered_blockers:
         return False
     kind = vision.grid[pos[1]][pos[0]]
     if kind in BLOCKING_KINDS:
@@ -361,6 +431,25 @@ def is_exit_tile(pos: Position, vision: PixelObservation) -> bool:
         "exit_normal",
         "exit_conditional",
     }
+
+
+def is_structural_exit_tile(pos: Position, vision: PixelObservation) -> bool:
+    """检查出口是否符合 NesyLink 门的两格结构，过滤单格误报。"""
+
+    if not is_exit_tile(pos, vision):
+        return False
+    col, row = pos
+    if row == 0 or row == GRID_HEIGHT - 1:
+        return (
+            is_exit_tile((col - 1, row), vision)
+            or is_exit_tile((col + 1, row), vision)
+        )
+    if col == 0 or col == GRID_WIDTH - 1:
+        return (
+            is_exit_tile((col, row - 1), vision)
+            or is_exit_tile((col, row + 1), vision)
+        )
+    return False
 
 
 def boundary_exit_action(pos: Position) -> int | None:
@@ -413,6 +502,8 @@ def manhattan(left: Position, right: Position) -> int:
 
 
 Policy = FSMBFSAgent
+Agent = FSMBFSAgent
+FinalAgent = FSMBFSAgent
 
 
 def make_policy() -> FSMBFSAgent:
