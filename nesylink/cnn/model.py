@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .components import COMPONENT_CLASSES, ComponentBox, component_boxes_from_class_grid
+from .components import CLASS_TO_ID, COMPONENT_CLASSES, ComponentBox, component_boxes_from_class_grid
 
 
 DYNAMIC_CLASSES = ("player", "monster")
@@ -119,8 +119,10 @@ def component_boxes_from_logits(
     logits: torch.Tensor,
     *,
     min_score: float = 0.50,
+    suppressed_classes: tuple[str, ...] = (),
 ) -> list[list[ComponentBox]]:
     """Decode model logits into connected component boxes for each batch item."""
+    logits = suppress_tile_classes(logits, suppressed_classes)
     probs = torch.softmax(logits, dim=1)
     scores, class_ids = probs.max(dim=1)
     class_ids = class_ids.cpu().numpy()
@@ -134,6 +136,18 @@ def component_boxes_from_logits(
     return batch_boxes
 
 
+def suppress_tile_classes(logits: torch.Tensor, class_names: tuple[str, ...]) -> torch.Tensor:
+    if not class_names:
+        return logits
+    adjusted = logits.clone()
+    min_value = torch.finfo(adjusted.dtype).min
+    for class_name in class_names:
+        class_id = CLASS_TO_ID.get(class_name)
+        if class_id is not None and class_id < adjusted.shape[1]:
+            adjusted[:, class_id, :, :] = min_value
+    return adjusted
+
+
 @torch.no_grad()
 def component_boxes_from_hybrid_output(
     output: dict[str, torch.Tensor],
@@ -143,14 +157,51 @@ def component_boxes_from_hybrid_output(
     dynamic_top_k: int = 8,
 ) -> list[list[ComponentBox]]:
     """Decode TinyHybridCNN output into boxes for every batch item."""
-    tile_boxes = component_boxes_from_logits(output["tile_logits"], min_score=tile_min_score)
+    tile_boxes = component_boxes_from_logits(
+        output["tile_logits"],
+        min_score=tile_min_score,
+        suppressed_classes=DYNAMIC_CLASSES,
+    )
     dynamic_boxes = dynamic_boxes_from_output(
         output["dynamic_heatmap_logits"],
         output["dynamic_box"],
         min_score=dynamic_min_score,
         top_k=dynamic_top_k,
     )
+    dynamic_boxes = [dedupe_dynamic_boxes(boxes) for boxes in dynamic_boxes]
     return [static + dynamic for static, dynamic in zip(tile_boxes, dynamic_boxes, strict=True)]
+
+
+def dedupe_dynamic_boxes(boxes: list[ComponentBox]) -> list[ComponentBox]:
+    players = [box for box in boxes if box.kind == "player"]
+    monsters = [box for box in boxes if box.kind == "monster"]
+    result: list[ComponentBox] = []
+    if players:
+        result.append(max(players, key=lambda box: box.score))
+    result.extend(non_max_suppression(monsters, iou_threshold=0.30))
+    return result
+
+
+def non_max_suppression(boxes: list[ComponentBox], *, iou_threshold: float) -> list[ComponentBox]:
+    kept: list[ComponentBox] = []
+    for box in sorted(boxes, key=lambda item: item.score, reverse=True):
+        if all(box_iou(box.bbox_px, kept_box.bbox_px) < iou_threshold for kept_box in kept):
+            kept.append(box)
+    return kept
+
+
+def box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    left = max(a[0], b[0])
+    top = max(a[1], b[1])
+    right = min(a[2], b[2])
+    bottom = min(a[3], b[3])
+    intersection = max(0, right - left) * max(0, bottom - top)
+    if intersection == 0:
+        return 0.0
+    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    union = area_a + area_b - intersection
+    return 0.0 if union <= 0 else intersection / union
 
 
 @torch.no_grad()
