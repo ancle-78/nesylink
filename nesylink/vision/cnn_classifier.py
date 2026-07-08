@@ -17,7 +17,7 @@ from nesylink.vision.pixel_classifier import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CHECKPOINT = PROJECT_ROOT / "nesylink" / "cnn" / "checkpoints" / "tiny_hybrid_cnn_quality.weights.pt"
+DEFAULT_CHECKPOINT = PROJECT_ROOT / "nesylink" / "cnn" / "checkpoints" / "tiny_hybrid_cnn_aligned.weights.pt"
 
 
 def classify_frame_cnn(

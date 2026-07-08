@@ -77,6 +77,17 @@ BLOCKING_KINDS = {
     "unknown",
 }
 
+# 这些是“看见过一次就应当保守记住”的静态阻挡/危险 tile。它们只来自历史
+# 像素观测，不来自地图真值。monster/player 不在这里，因为它们会移动。
+STATIC_BLOCKING_KINDS = {
+    "wall",
+    "chest",
+    "trap",
+    "abyss",
+    "gap",
+    "npc",
+}
+
 # 这些 tile 可以作为 BFS 的普通通行区域。exit_conditional 在拿到钥匙且击杀
 # 怪物后才真正能完成任务，但从视觉/路径角度它仍是边界出口 tile。
 SAFE_WALKABLE_KINDS = {
@@ -106,6 +117,7 @@ class Task2FSMBFSAgent:
     monster_missing_frames: int = 0
     monster_cleared: bool = False
     remembered_chest_tiles: set[Position] = field(default_factory=set)
+    remembered_static_blocked_tiles: set[Position] = field(default_factory=set)
     target_exit_tile: Position | None = None
     exit_push_action: int | None = None
     last_move_action: int | None = None
@@ -121,6 +133,7 @@ class Task2FSMBFSAgent:
         self.monster_missing_frames = 0
         self.monster_cleared = False
         self.remembered_chest_tiles.clear()
+        self.remembered_static_blocked_tiles.clear()
         self.target_exit_tile = None
         self.exit_push_action = None
         self.last_move_action = None
@@ -255,7 +268,7 @@ class Task2FSMBFSAgent:
             target_tiles,
             vision,
             allow_goals_next_to_monster=True,
-            extra_blocked=self.remembered_chest_tiles,
+            extra_blocked=self._remembered_static_blockers(),
         )
         if len(path) >= 2:
             return self._start_tile_step(action_toward(path[0], path[1]), vision)
@@ -278,7 +291,7 @@ class Task2FSMBFSAgent:
                 return face_action
             return ACTION_A
 
-        path = bfs_path(player, adjacent, vision, extra_blocked=self.remembered_chest_tiles)
+        path = bfs_path(player, adjacent, vision, extra_blocked=self._remembered_static_blockers())
         if len(path) >= 2:
             return self._start_tile_step(action_toward(path[0], path[1]), vision)
         return ACTION_NOOP
@@ -307,7 +320,7 @@ class Task2FSMBFSAgent:
             self.target_exit_tile = player
             return self.exit_push_action or ACTION_NOOP
 
-        path = bfs_path(player, reachable_exit_tiles, vision, extra_blocked=self.remembered_chest_tiles)
+        path = bfs_path(player, reachable_exit_tiles, vision, extra_blocked=self._remembered_static_blockers())
         if len(path) >= 2:
             self.target_exit_tile = path[-1]
             return self._start_tile_step(action_toward(path[0], path[1]), vision)
@@ -386,22 +399,29 @@ class Task2FSMBFSAgent:
         )
 
     def _remember_visible_objects(self, vision: PixelObservation) -> None:
-        """记住曾经从视觉中看到过的宝箱位置。
+        """记住曾经从视觉中看到过的静态阻挡位置。
 
         Task 2 的宝箱打开后，视觉分类器可能仍把打开后的图案识别成 chest，
         也可能在未来的 CNN 版本中把它识别成 floor。环境里宝箱附近仍可能产生
-        像素级碰撞/贴边堵塞，所以这里把“曾经看见过宝箱”的 tile 当成保守阻挡
+        像素级碰撞/贴边堵塞；墙、陷阱、gap 等静态障碍也不应因为某一帧误判
+        成 floor 就被 BFS 当成通路。因此这里把历史视觉中明确见过的静态阻挡
         记下来。这个记忆只来自历史 obs，不来自地图真值或隐藏 info。
         """
 
         self.remembered_chest_tiles.update(self._chest_tiles(vision))
+        self.remembered_static_blocked_tiles.update(self._tiles_of_kind(vision, STATIC_BLOCKING_KINDS))
 
     def _is_walkable(self, pos: Position, vision: PixelObservation, *, allow_next_to_monster: bool = False) -> bool:
-        """结合当前视觉和历史宝箱记忆判断 tile 是否可走。"""
+        """结合当前视觉和历史静态阻挡记忆判断 tile 是否可走。"""
 
-        if pos in self.remembered_chest_tiles:
+        if pos in self._remembered_static_blockers():
             return False
         return is_walkable(pos, vision, allow_next_to_monster=allow_next_to_monster)
+
+    def _remembered_static_blockers(self) -> set[Position]:
+        """返回当前单房间任务中历史记住的所有静态阻挡。"""
+
+        return self.remembered_static_blocked_tiles | self.remembered_chest_tiles
 
     def _monster_tiles(self, vision: PixelObservation) -> set[Position]:
         """返回当前视觉帧中所有怪物 tile。"""
