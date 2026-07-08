@@ -30,6 +30,18 @@ EDGE_EXIT_TILES = {
     "east": {(GRID_WIDTH - 1, 3), (GRID_WIDTH - 1, 4)},
 }
 
+PLAYER_CONTEXTS = (
+    "floor",
+    "bridge",
+    "gap",
+    "spike_trap",
+    "abyss_trap",
+    "exit_tile",
+    "exit_adjacent",
+)
+PLAYER_FACINGS = ("down", "up", "left", "right")
+SCENE_STYLES = ("mixed", "abyss_bridge")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate one synthetic NesyLink scene PNG for CNN experiments.")
@@ -45,13 +57,21 @@ def parse_args() -> argparse.Namespace:
         default=(0, 0),
         help="Move the rendered player by pixel offsets after room construction.",
     )
+    parser.add_argument("--player-context", choices=PLAYER_CONTEXTS, default=None)
+    parser.add_argument("--player-facing", choices=PLAYER_FACINGS, default=None)
+    parser.add_argument("--scene-style", choices=SCENE_STYLES, default="mixed")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     rng = random.Random(args.seed)
-    payload = build_synthetic_room(rng)
+    payload = build_synthetic_room(
+        rng,
+        player_context=args.player_context,
+        player_facing=args.player_facing,
+        scene_style=args.scene_style,
+    )
 
     with tempfile.TemporaryDirectory(prefix="nesylink_cnn_scene_") as tmpdir:
         room_path = Path(tmpdir) / "synthetic_room.json"
@@ -59,6 +79,7 @@ def main() -> None:
         manager = RoomManager(room_path)
         room = manager.get_room(manager.start_room)
         player = PlayerState(position_px=tile_to_top_left_px(room.spawns[room.default_spawn_name]))
+        player.facing = player_facing_from_payload(payload)
         apply_player_offset(player, tuple(args.player_offset_px))
         write_player_pixel_annotation(payload, player)
         frame = render_frame(room, player)
@@ -93,19 +114,32 @@ def write_player_pixel_annotation(payload: dict[str, Any], player: PlayerState) 
     top = int(round(player.position_px[1]))
     right = left + int(player.size_px)
     bottom = top + int(player.size_px)
-    payload["annotations"] = {
-        "pixel_boxes": [
-            {
-                "kind": "player",
-                "label": "player_px",
-                "bbox_px": [left, top, right, bottom],
-                "center_px": [(left + right) * 0.5, (top + bottom) * 0.5],
-            }
-        ]
-    }
+    annotations = payload.get("annotations", {})
+    if not isinstance(annotations, dict):
+        annotations = {}
+    else:
+        annotations = dict(annotations)
+    annotations["pixel_boxes"] = [
+        {
+            "kind": "player",
+            "label": "player_px",
+            "bbox_px": [left, top, right, bottom],
+            "center_px": [(left + right) * 0.5, (top + bottom) * 0.5],
+        }
+    ]
+    payload["annotations"] = annotations
 
 
-def build_synthetic_room(rng: random.Random) -> dict[str, Any]:
+def build_synthetic_room(
+    rng: random.Random,
+    *,
+    player_context: str | None = None,
+    player_facing: str | None = None,
+    scene_style: str = "mixed",
+) -> dict[str, Any]:
+    if scene_style == "abyss_bridge":
+        return build_abyss_bridge_room(rng, player_context=player_context, player_facing=player_facing)
+
     blocked: set[tuple[int, int]] = set()
     layout = [["." for _x in range(GRID_WIDTH)] for _y in range(GRID_HEIGHT)]
 
@@ -115,8 +149,10 @@ def build_synthetic_room(rng: random.Random) -> dict[str, Any]:
     dynamic_objects, dynamic_tiles = build_bridge_if_possible(rng, reserved)
     blocked.update(dynamic_tiles)
 
-    player_pos = choose_free_tile(rng, blocked | reserved, margin=True)
+    context = choose_player_context(rng, player_context, dynamic_objects)
+    player_pos = choose_player_tile(rng, context, blocked, reserved, exit_direction, dynamic_objects)
     blocked.add(player_pos)
+    facing = choose_player_facing(rng, player_facing)
 
     wall_count = rng.randint(6, 12)
     for _ in range(wall_count):
@@ -125,6 +161,7 @@ def build_synthetic_room(rng: random.Random) -> dict[str, Any]:
         blocked.add(pos)
 
     objects: list[dict[str, Any]] = []
+    add_player_background_object(objects, context, player_pos)
     occupied = set(blocked) | reserved
     add_chests(rng, objects, occupied, count=rng.randint(1, 3))
     add_npcs(rng, objects, occupied, count=rng.randint(1, 2))
@@ -158,7 +195,283 @@ def build_synthetic_room(rng: random.Random) -> dict[str, Any]:
         "objects": objects,
         "dynamic_objects": dynamic_objects,
         "exits": [exit_config],
+        "annotations": {
+            "scene_style": "mixed",
+            "player_context": context,
+            "player_facing": facing,
+            "player_tile": [player_pos[0], player_pos[1]],
+        },
     }
+
+
+def player_context_for_index(index: int) -> str:
+    return PLAYER_CONTEXTS[(index // len(PLAYER_FACINGS)) % len(PLAYER_CONTEXTS)]
+
+
+def player_facing_for_index(index: int) -> str:
+    return PLAYER_FACINGS[index % len(PLAYER_FACINGS)]
+
+
+def scene_style_for_index(index: int) -> str:
+    # Half of the data uses Task4-center-like abyss rooms to teach long bridges over abyss.
+    return "abyss_bridge" if index % 2 == 0 else "mixed"
+
+
+def player_facing_from_payload(payload: dict[str, Any]) -> str:
+    annotations = payload.get("annotations", {})
+    if isinstance(annotations, dict):
+        facing = annotations.get("player_facing")
+        if facing in PLAYER_FACINGS:
+            return str(facing)
+    return "down"
+
+
+def choose_player_context(
+    rng: random.Random,
+    requested: str | None,
+    dynamic_objects: list[dict[str, Any]],
+) -> str:
+    if requested in PLAYER_CONTEXTS:
+        context = str(requested)
+    else:
+        context = rng.choice(PLAYER_CONTEXTS)
+    if context in {"bridge", "gap"} and not dynamic_objects:
+        return "floor"
+    return context
+
+
+def choose_player_facing(rng: random.Random, requested: str | None) -> str:
+    if requested in PLAYER_FACINGS:
+        return str(requested)
+    return rng.choice(PLAYER_FACINGS)
+
+
+def choose_player_tile(
+    rng: random.Random,
+    context: str,
+    blocked: set[tuple[int, int]],
+    reserved: set[tuple[int, int]],
+    exit_direction: str,
+    dynamic_objects: list[dict[str, Any]],
+) -> tuple[int, int]:
+    if context == "bridge":
+        candidates = sorted(active_bridge_tiles(dynamic_objects) - reserved)
+        if candidates:
+            return rng.choice(candidates)
+    if context == "gap":
+        candidates = sorted(all_dynamic_tiles(dynamic_objects) - active_bridge_tiles(dynamic_objects) - reserved)
+        if candidates:
+            return rng.choice(candidates)
+    if context == "exit_tile":
+        return rng.choice(sorted(reserved))
+    if context == "exit_adjacent":
+        candidates = sorted(exit_approach_tiles(exit_direction) - blocked - reserved)
+        if candidates:
+            return rng.choice(candidates)
+    return choose_free_tile(rng, blocked | reserved, margin=True)
+
+
+def active_bridge_tiles(dynamic_objects: list[dict[str, Any]]) -> set[tuple[int, int]]:
+    tiles: set[tuple[int, int]] = set()
+    for dynamic_object in dynamic_objects:
+        initial_state = str(dynamic_object.get("initial_state", ""))
+        state = dynamic_object.get("states", {}).get(initial_state, {})
+        for x, y in state.get("tiles", []):
+            tiles.add((int(x), int(y)))
+    return tiles
+
+
+def all_dynamic_tiles(dynamic_objects: list[dict[str, Any]]) -> set[tuple[int, int]]:
+    tiles: set[tuple[int, int]] = set()
+    for dynamic_object in dynamic_objects:
+        for state in dynamic_object.get("states", {}).values():
+            for x, y in state.get("tiles", []):
+                tiles.add((int(x), int(y)))
+    return tiles
+
+
+def exit_approach_tiles(direction: str) -> set[tuple[int, int]]:
+    if direction == "north":
+        return {(4, 1), (5, 1)}
+    if direction == "south":
+        return {(4, GRID_HEIGHT - 2), (5, GRID_HEIGHT - 2)}
+    if direction == "west":
+        return {(1, 3), (1, 4)}
+    if direction == "east":
+        return {(GRID_WIDTH - 2, 3), (GRID_WIDTH - 2, 4)}
+    return set()
+
+
+def add_player_background_object(
+    objects: list[dict[str, Any]],
+    context: str,
+    player_pos: tuple[int, int],
+) -> None:
+    if context not in {"spike_trap", "abyss_trap"}:
+        return
+    objects.append(
+        {
+            "id": "player_background_trap",
+            "kind": "trap",
+            "pos": [player_pos[0], player_pos[1]],
+            "trap_type": "spike" if context == "spike_trap" else "abyss",
+            "damage": 1,
+            "respawn_to": "default",
+        }
+    )
+
+
+def build_abyss_bridge_room(
+    rng: random.Random,
+    *,
+    player_context: str | None = None,
+    player_facing: str | None = None,
+) -> dict[str, Any]:
+    states = abyss_bridge_states()
+    initial_state = rng.choice(list(states))
+    active_tiles = set(states[initial_state])
+    context = choose_abyss_player_context(rng, player_context)
+    player_pos = choose_abyss_player_tile(rng, context, active_tiles)
+    facing = choose_player_facing(rng, player_facing)
+
+    return {
+        "id": "synthetic_abyss_bridge",
+        "coord": [0, 0],
+        "layout": ["." * GRID_WIDTH for _ in range(GRID_HEIGHT)],
+        "spawns": {
+            "default": [player_pos[0], player_pos[1]],
+            "west_door": [1, 4],
+            "east_door": [8, 4],
+            "from_north": [4, 1],
+            "from_south": [4, 6],
+        },
+        "default_spawn": "default",
+        "objects": [
+            {
+                "id": "full_abyss",
+                "kind": "trap",
+                "trap_type": "abyss",
+                "damage": 1,
+                "respawn_delay_steps": 2,
+                "rects": [{"from": [0, 0], "to": [GRID_WIDTH - 1, GRID_HEIGHT - 1]}],
+            },
+            {
+                "id": "hidden_bridge_chest",
+                "kind": "chest",
+                "pos": [4, 4],
+                "hidden": True,
+                "loot": {"kind": "gold", "amount": 1},
+            },
+        ],
+        "dynamic_objects": [
+            {
+                "id": "center_bridge",
+                "kind": "rotating_bridge",
+                "initial_state": initial_state,
+                "background_tile": "none",
+                "active_tile": "bridge",
+                "states": {
+                    state_id: {"tiles": [[x, y] for x, y in tiles]}
+                    for state_id, tiles in states.items()
+                },
+            }
+        ],
+        "exits": [
+            {
+                "id": "west_exit",
+                "direction": "west",
+                "target_room": "synthetic_abyss_bridge",
+                "target_entry": "east_door",
+                "type": "normal",
+                "success_message": "WEST",
+            },
+            {
+                "id": "east_exit",
+                "direction": "east",
+                "target_room": "synthetic_abyss_bridge",
+                "target_entry": "west_door",
+                "type": "locked_key",
+                "requires": {"key_count": 1, "consume_key": False},
+                "blocked_message": "NEED KEY",
+                "success_message": "SWORD ROOM",
+            },
+            {
+                "id": "north_exit",
+                "direction": "north",
+                "target_room": "synthetic_abyss_bridge",
+                "target_entry": "from_south",
+                "type": "normal",
+                "success_message": "KEY ROOM",
+            },
+            {
+                "id": "south_exit",
+                "direction": "south",
+                "target_room": "synthetic_abyss_bridge",
+                "target_entry": "from_north",
+                "type": "normal",
+                "success_message": "MONSTER ROOM",
+            },
+        ],
+        "annotations": {
+            "scene_style": "abyss_bridge",
+            "player_context": context,
+            "player_facing": facing,
+            "player_tile": [player_pos[0], player_pos[1]],
+            "active_bridge_state": initial_state,
+        },
+    }
+
+
+def abyss_bridge_states() -> dict[str, tuple[tuple[int, int], ...]]:
+    def hrow(x0: int, x1: int) -> set[tuple[int, int]]:
+        return {(x, y) for x in range(x0, x1 + 1) for y in (3, 4)}
+
+    def vcol(y0: int, y1: int) -> set[tuple[int, int]]:
+        return {(x, y) for y in range(y0, y1 + 1) for x in (4, 5)}
+
+    raw_states = {
+        "west_to_north": hrow(0, 5) | vcol(0, 4),
+        "west_to_east": hrow(0, GRID_WIDTH - 1),
+        "west_to_south": hrow(0, 5) | vcol(3, GRID_HEIGHT - 1),
+        "east_to_north": hrow(4, GRID_WIDTH - 1) | vcol(0, 4),
+        "east_to_south": hrow(4, GRID_WIDTH - 1) | vcol(3, GRID_HEIGHT - 1),
+        "north_to_south": vcol(0, GRID_HEIGHT - 1),
+    }
+    return {name: tuple(sorted(tiles)) for name, tiles in raw_states.items()}
+
+
+def choose_abyss_player_context(rng: random.Random, requested: str | None) -> str:
+    if requested in {"bridge", "exit_tile", "exit_adjacent", "abyss_trap"}:
+        return str(requested)
+    if requested in {"gap", "spike_trap"}:
+        return "abyss_trap"
+    if requested == "floor":
+        return "bridge"
+    return rng.choice(["bridge", "bridge", "bridge", "exit_tile", "exit_adjacent", "abyss_trap"])
+
+
+def choose_abyss_player_tile(
+    rng: random.Random,
+    context: str,
+    active_tiles: set[tuple[int, int]],
+) -> tuple[int, int]:
+    all_tiles = {(x, y) for y in range(GRID_HEIGHT) for x in range(GRID_WIDTH)}
+    if context == "exit_tile":
+        candidates = sorted(set().union(*EDGE_EXIT_TILES.values()) & active_tiles)
+        if candidates:
+            return rng.choice(candidates)
+    if context == "exit_adjacent":
+        candidates = sorted(set().union(*(exit_approach_tiles(direction) for direction in EDGE_EXIT_TILES)) & active_tiles)
+        if candidates:
+            return rng.choice(candidates)
+    if context == "abyss_trap":
+        candidates = sorted(all_tiles - active_tiles - set().union(*EDGE_EXIT_TILES.values()))
+        if candidates:
+            return rng.choice(candidates)
+    candidates = sorted(active_tiles)
+    if not candidates:
+        raise RuntimeError("abyss bridge room has no active bridge tiles")
+    return rng.choice(candidates)
 
 
 def add_chests(

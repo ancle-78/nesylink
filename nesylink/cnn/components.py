@@ -125,10 +125,39 @@ def labels_from_room_json(payload: dict[str, Any]) -> np.ndarray:
 
 
 def static_labels_from_room_json(payload: dict[str, Any]) -> np.ndarray:
-    """Build tile labels while leaving pixel-moving player/monster as floor."""
-    labels = labels_from_room_json(payload)
-    labels[labels == CLASS_TO_ID["player"]] = CLASS_TO_ID["floor"]
-    labels[labels == CLASS_TO_ID["monster"]] = CLASS_TO_ID["floor"]
+    """Build tile labels while keeping pixel-moving entities out of the grid target."""
+    labels = np.full((GRID_HEIGHT, GRID_WIDTH), CLASS_TO_ID["floor"], dtype=np.int64)
+
+    for y, row in enumerate(payload.get("layout", [])):
+        if not isinstance(row, str):
+            continue
+        for x, value in enumerate(row[:GRID_WIDTH]):
+            if y < GRID_HEIGHT and value == "#":
+                labels[y, x] = CLASS_TO_ID["wall"]
+
+    for obj in payload.get("dynamic_objects", []):
+        if not isinstance(obj, dict):
+            continue
+        write_dynamic_object_labels(labels, obj)
+
+    for exit_cfg in payload.get("exits", []):
+        if not isinstance(exit_cfg, dict):
+            continue
+        exit_class = exit_class_from_config(exit_cfg)
+        for x, y in EXIT_TILES.get(str(exit_cfg.get("direction", "")), []):
+            labels[y, x] = CLASS_TO_ID[exit_class]
+
+    dynamic_objects = [obj for obj in payload.get("dynamic_objects", []) if isinstance(obj, dict)]
+    for obj in payload.get("objects", []):
+        if not isinstance(obj, dict) or str(obj.get("kind")) == "monster":
+            continue
+        write_object_label(labels, obj)
+
+    # Dynamic bridge/gap tiles are drawn underneath exits but protect traps from rendering.
+    # Reapply them last so full-map abyss traps do not erase active bridges in the target grid.
+    for obj in dynamic_objects:
+        write_dynamic_object_labels(labels, obj)
+
     return labels
 
 

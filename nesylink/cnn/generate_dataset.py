@@ -18,7 +18,15 @@ CNN_DIR = Path(__file__).resolve().parent
 
 from nesylink.cnn.annotate_scene import collect_component_boxes
 from nesylink.cnn.components import draw_component_boxes
-from nesylink.cnn.generate_synthetic_scene import apply_player_offset, build_synthetic_room, write_player_pixel_annotation
+from nesylink.cnn.generate_synthetic_scene import (
+    apply_player_offset,
+    build_synthetic_room,
+    player_context_for_index,
+    player_facing_for_index,
+    player_facing_from_payload,
+    scene_style_for_index,
+    write_player_pixel_annotation,
+)
 from nesylink.core.constants import MAP_PIXEL_HEIGHT, MAP_PIXEL_WIDTH
 from nesylink.core.rendering import render_frame
 from nesylink.core.state import PlayerState, tile_to_top_left_px
@@ -86,7 +94,18 @@ def generate_split(
         image_path = out_dir / f"{prefix}_{index:04d}.png"
         json_path = image_path.with_suffix(".json")
         offset = player_offset_for_index(index)
-        generate_one(seed, offset, image_path, json_path)
+        context = player_context_for_index(index)
+        facing = player_facing_for_index(index)
+        scene_style = scene_style_for_index(index)
+        generate_one(
+            seed,
+            offset,
+            image_path,
+            json_path,
+            player_context=context,
+            player_facing=facing,
+            scene_style=scene_style,
+        )
         image_paths.append(image_path)
         if annotate:
             annotated_path = image_path.with_name(f"{image_path.stem}_annotated.png")
@@ -101,9 +120,18 @@ def generate_one(
     player_offset_px: tuple[int, int],
     image_path: Path,
     json_path: Path,
+    *,
+    player_context: str | None = None,
+    player_facing: str | None = None,
+    scene_style: str = "mixed",
 ) -> None:
     rng = random.Random(seed)
-    payload = build_synthetic_room(rng)
+    payload = build_synthetic_room(
+        rng,
+        player_context=player_context,
+        player_facing=player_facing,
+        scene_style=scene_style,
+    )
 
     with tempfile.TemporaryDirectory(prefix="nesylink_cnn_dataset_") as tmpdir:
         room_path = Path(tmpdir) / "synthetic_room.json"
@@ -111,6 +139,7 @@ def generate_one(
         manager = RoomManager(room_path)
         room = manager.get_room(manager.start_room)
         player = PlayerState(position_px=tile_to_top_left_px(room.spawns[room.default_spawn_name]))
+        player.facing = player_facing_from_payload(payload)
         apply_player_offset(player, player_offset_px)
         write_player_pixel_annotation(payload, player)
         frame = render_frame(room, player)
