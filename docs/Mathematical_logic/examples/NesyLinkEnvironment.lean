@@ -128,6 +128,7 @@ structure Button where
 structure Switch where
   id : ObjectId
   pos : Position
+  targetRoom : RoomId
   targetBridge : ObjectId
   pressed : Bool := false
   deriving DecidableEq, Repr
@@ -137,6 +138,12 @@ structure Bridge where
   orientation : BridgeOrientation
   horizontalTiles : List Position
   verticalTiles : List Position
+  deriving DecidableEq, Repr
+
+structure Npc where
+  id : ObjectId
+  pos : Position
+  text : String
   deriving DecidableEq, Repr
 
 structure Inventory where
@@ -190,7 +197,7 @@ structure Exit where
 structure RoomState where
   bounds : Bounds
   walls : List Position
-  npcs : List Position
+  npcs : List Npc
   chests : List Chest
   monsters : List Monster
   traps : List Trap
@@ -232,6 +239,16 @@ def actionDirection : Action → Option Direction
   | .right => some .east
   | _ => none
 
+def directionAction : Direction → Action
+  | .north => .up
+  | .south => .down
+  | .west => .left
+  | .east => .right
+
+theorem directionAction_correct (d : Direction) :
+    actionDirection (directionAction d) = some d := by
+  cases d <;> rfl
+
 def adjacent (a b : Position) : Prop :=
   b = advance a .north ∨ b = advance a .south ∨
   b = advance a .west ∨ b = advance a .east
@@ -254,6 +271,9 @@ def activeTrapAt (r : RoomState) (p : Position) : Prop :=
 def buttonAt (r : RoomState) (p : Position) : Prop :=
   ∃ b ∈ r.buttons, b.pos = p
 
+def npcAt (r : RoomState) (p : Position) : Prop :=
+  ∃ npc ∈ r.npcs, npc.pos = p
+
 def activeBridgeTile (r : RoomState) (p : Position) : Prop :=
   ∃ b ∈ r.bridges,
     (b.orientation = .horizontal ∧ p ∈ b.horizontalTiles) ∨
@@ -264,7 +284,7 @@ def gapAt (r : RoomState) (p : Position) : Prop :=
 
 def staticBlocker (r : RoomState) (p : Position) : Prop :=
   -- 宝箱打开后仍保留实体碰撞，因此这里判断 visible，而不是 closed。
-  p ∈ r.walls ∨ p ∈ r.npcs ∨ visibleChestAt r p
+  p ∈ r.walls ∨ npcAt r p ∨ visibleChestAt r p
 
 def canEnter (r : RoomState) (p : Position) : Prop :=
   inBounds r.bounds p ∧
@@ -364,6 +384,28 @@ def deactivateTrap (r : RoomState) (target : Trap) : RoomState :=
         if t.id = target.id then { t with active := false } else t) }
   else r
 
+def activateSwitchState (s : WorldState) (switch : Switch) : WorldState :=
+  let pressedCurrent :=
+    replaceSwitch (currentRoomState s) switch { switch with pressed := true }
+  let roomsAfterPress := setRoom s.rooms s.currentRoom pressedCurrent
+  let targetAfterPress := roomsAfterPress switch.targetRoom
+  { s with
+    rooms := setRoom roomsAfterPress switch.targetRoom
+      (rotateBridge targetAfterPress switch.targetBridge)
+    player := { s.player with shielding := false } }
+
+theorem activateSwitchState_current_bounds
+    (s : WorldState) (switch : Switch) :
+    (currentRoomState (activateSwitchState s switch)).bounds =
+      (currentRoomState s).bounds := by
+  unfold activateSwitchState currentRoomState
+  by_cases hsame : switch.targetRoom = s.currentRoom
+  · rw [hsame]
+    simp [setRoom, replaceSwitch, rotateBridge]
+  · have hother : s.currentRoom ≠ switch.targetRoom := by
+      exact fun h => hsame h.symm
+    simp [setRoom, hother, replaceSwitch]
+
 /-! ## 六、事件与单步状态转移语义
 
 事件不是隐藏真值输入，而是 Lean 模型对一次符号转移结果的说明，便于之后
@@ -379,6 +421,7 @@ inductive Event where
   | trapTriggered (id : ObjectId)
   | abyssFall (id : ObjectId)
   | chestOpened (id : ObjectId)
+  | talkedNpc (id : ObjectId)
   | monsterDamaged (id : ObjectId)
   | monsterKilled (id : ObjectId)
   | monsterMoved (id : ObjectId) (source target : Position)
@@ -396,8 +439,12 @@ def validPlayerPosition (s : WorldState) : Prop :=
   let r := currentRoomState s
   inBounds r.bounds s.player.pos ∧ ¬ staticBlocker r s.player.pos ∧ ¬ gapAt r s.player.pos
 
+def CollisionFreeState (s : WorldState) : Prop :=
+  validPlayerPosition s
+
 def ValidState (s : WorldState) : Prop :=
-  validPlayerPosition s ∧ s.player.hp ≤ s.player.maxHp
+  inBounds (currentRoomState s).bounds s.player.pos ∧
+  s.player.hp ≤ s.player.maxHp
 
 def alive (s : WorldState) : Prop := 0 < s.player.hp
 def dead (s : WorldState) : Prop := s.player.hp = 0
@@ -411,11 +458,37 @@ def allWorldChestsOpened (s : WorldState) : Prop :=
   ∀ roomId, roomId ∈ s.roomIds →
     allVisibleChestsOpened (s.rooms roomId)
 
+def trapEvents
+    (source target : Position) (trap : Trap) : List Event :=
+  if trap.kind = .abyss then
+    [.moved source target, .abyssFall trap.id, .agentDamaged trap.damage]
+  else
+    [.moved source target, .trapTriggered trap.id, .agentDamaged trap.damage]
+
+def openChestInteractionAvailable (s : WorldState) : Prop :=
+  ∃ chest ∈ (currentRoomState s).chests,
+    chest.visible = true ∧ chest.opened = false ∧
+    adjacent s.player.pos chest.pos
+
+def npcInteractionAvailable (s : WorldState) : Prop :=
+  ∃ npc ∈ (currentRoomState s).npcs,
+    adjacent s.player.pos npc.pos
+
+def switchInteractionAvailable (s : WorldState) : Prop :=
+  ∃ switch ∈ (currentRoomState s).switches,
+    adjacent s.player.pos switch.pos
+
+def primaryInteractionAvailable (s : WorldState) : Prop :=
+  openChestInteractionAvailable s ∨
+  npcInteractionAvailable s ∨
+  switchInteractionAvailable s
+
 /-!
-`Step s a t events` 是符号环境的权威转移关系。怪物 AI 被有意建模为非确定性：
-`monsterMove` 可以选择任意相邻、界内、非阻挡且不被另一只怪物占据的位置。
-这保留了 chaser/patroller/ambusher 依赖类型、时间和随机数的事实，同时仍然
-能够证明其移动遵守基础地图约束。
+`Step s a t events` 是符号环境的微步转移关系。玩家动作、出口判定、tile
+效果、怪物更新和接触结算在 Python 的一次 tick 中顺序发生；Lean 将这些阶段
+拆成可组合微步，以便分别证明。玩家发起的微步保留真实动作，怪物移动和接触
+等自主阶段使用 `wait` 作为“无新增玩家输入”标签。怪物 AI 被有意建模为
+非确定性，但每次移动仍必须相邻、界内、非阻挡且不与另一怪物重叠。
 -/
 inductive Step : WorldState → Action → WorldState → List Event → Prop where
   -- WAIT 不改变位置和资源，但会结束上一帧的临时举盾状态。
@@ -447,8 +520,8 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
           (pressButtonAt (currentRoomState s) q))
         [.moved s.player.pos q, .buttonPressed button.id]
 
-  -- 踩陷阱移动：扣除伤害、回到配置的合法重生点，一次性陷阱同时失活。
-  | moveTrap {s : WorldState} {a : Action} {d : Direction} {q : Position}
+  -- 陷阱存活分支：扣血后 HP 仍为正，玩家回到合法重生点。
+  | moveTrapSurvive {s : WorldState} {a : Action} {d : Direction} {q : Position}
       {trap : Trap}
       (ha : actionDirection a = some d)
       (hq : q = advance s.player.pos d)
@@ -456,6 +529,7 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
       (htrap : trap ∈ (currentRoomState s).traps)
       (hpos : trap.pos = q)
       (hactive : trap.active = true)
+      (hsurvives : 0 < (damagePlayer s.player trap.damage).hp)
       (hrespawn : canEnter (currentRoomState s) trap.respawn) :
       Step s a
         (updateCurrentRoom
@@ -463,10 +537,24 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
               { damagePlayer s.player trap.damage with
                 pos := trap.respawn, facing := d } }
           (deactivateTrap (currentRoomState s) trap))
-        (if trap.kind = .abyss then
-          [.moved s.player.pos q, .abyssFall trap.id, .agentDamaged trap.damage]
-         else
-          [.moved s.player.pos q, .trapTriggered trap.id, .agentDamaged trap.damage])
+        (trapEvents s.player.pos q trap)
+
+  -- 陷阱致死分支：HP 归零时 Python 不执行重生，玩家留在触发 tile。
+  | moveTrapFatal {s : WorldState} {a : Action} {d : Direction} {q : Position}
+      {trap : Trap}
+      (ha : actionDirection a = some d)
+      (hq : q = advance s.player.pos d)
+      (henter : canEnter (currentRoomState s) q)
+      (htrap : trap ∈ (currentRoomState s).traps)
+      (hpos : trap.pos = q)
+      (hactive : trap.active = true)
+      (hfatal : (damagePlayer s.player trap.damage).hp = 0) :
+      Step s a
+        (updateCurrentRoom
+          { s with player :=
+              { damagePlayer s.player trap.damage with pos := q, facing := d } }
+          (deactivateTrap (currentRoomState s) trap))
+        (trapEvents s.player.pos q trap)
 
   -- 撞墙/越界/gap/宝箱：更新朝向但保持玩家位置不变，并产生 blocked 事件。
   | moveBlocked {s : WorldState} {a : Action} {d : Direction}
@@ -497,8 +585,18 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
           (replaceChest (currentRoomState s) chest { chest with opened := true }))
         [.chestOpened chest.id]
 
+  -- NPC 对话优先于 switch 和剑；只有不存在可开启宝箱时才进入该分支。
+  | talkNpc {s : WorldState} {npc : Npc}
+      (hnoChest : ¬ openChestInteractionAvailable s)
+      (hmember : npc ∈ (currentRoomState s).npcs)
+      (hadj : adjacent s.player.pos npc.pos) :
+      Step s .slotA
+        { s with player := { s.player with shielding := false } }
+        [.talkedNpc npc.id]
+
   -- 未击杀攻击：必须有剑且怪物正好位于面前一格，扣除攻击力对应的 HP。
   | attackDamage {s : WorldState} {monster : Monster} {power : Nat}
+      (hnoInteraction : ¬ primaryInteractionAvailable s)
       (hsword : Item.sword ∈ s.player.inventory.items)
       (hmember : monster ∈ (currentRoomState s).monsters)
       (htarget : monster.pos = advance s.player.pos s.player.facing)
@@ -513,6 +611,7 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
 
   -- 击杀攻击：从房间怪物列表删除目标，并把配置的击杀金币加入背包。
   | attackKill {s : WorldState} {monster : Monster} {power reward : Nat}
+      (hnoInteraction : ¬ primaryInteractionAvailable s)
       (hsword : Item.sword ∈ s.player.inventory.items)
       (hmember : monster ∈ (currentRoomState s).monsters)
       (htarget : monster.pos = advance s.player.pos s.player.facing)
@@ -565,14 +664,14 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
 
   -- 相邻使用 switch：记录 switch 已触发，并切换其目标桥的横/纵朝向。
   | activateSwitch {s : WorldState} {switch : Switch}
+      (hnoChest : ¬ openChestInteractionAvailable s)
+      (hnoNpc : ¬ npcInteractionAvailable s)
       (hmember : switch ∈ (currentRoomState s).switches)
-      (hadj : adjacent s.player.pos switch.pos) :
+      (hadj : adjacent s.player.pos switch.pos)
+      (hbridge : ∃ bridge ∈ (s.rooms switch.targetRoom).bridges,
+        bridge.id = switch.targetBridge) :
       Step s .slotA
-        (updateCurrentRoom
-          { s with player := { s.player with shielding := false } }
-          (replaceSwitch
-            (rotateBridge (currentRoomState s) switch.targetBridge)
-            switch { switch with pressed := true }))
+        (activateSwitchState s switch)
         [.switchActivated switch.id, .bridgeRotated switch.targetBridge]
 
   -- 成功使用出口：检查全部条件，必要时消耗钥匙，并切换房间和 spawn。
@@ -583,7 +682,7 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
       (hreq : requirementSatisfied s exit.requirement)
       (htarget : target = s.rooms exit.targetRoom)
       (hspawn : canEnter target exit.targetSpawn) :
-      Step s .wait
+      Step s (directionAction exit.direction)
         { s with
           currentRoom := exit.targetRoom
           player :=
@@ -604,7 +703,7 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
       (hat : s.player.pos = exit.pos)
       (hfacing : s.player.facing = exit.direction)
       (hreq : ¬ requirementSatisfied s exit.requirement) :
-      Step s .wait s [.blocked exit.pos]
+      Step s (directionAction exit.direction) s [.blocked exit.pos]
 
   -- Task5 没有完成型出口：Python 在所有有限模板房间的宝箱均可见且打开后完成。
   | completeAllChests {s : WorldState}
@@ -686,6 +785,11 @@ theorem setRoom_other (rooms : RoomId → RoomState) (id other : RoomId)
     setRoom rooms id r other = rooms other := by
   simp [setRoom, h]
 
+@[simp] theorem currentRoomState_updateCurrentRoom
+    (s : WorldState) (room : RoomState) :
+    currentRoomState (updateCurrentRoom s room) = room := by
+  simp [currentRoomState, updateCurrentRoom, setRoom]
+
 -- 生命值不变量：伤害不会增加 HP，任何 loot（包括治疗）都不突破 maxHp。
 theorem damage_hp_le (p : PlayerState) (amount : Nat) :
     (damagePlayer p amount).hp ≤ p.hp := by
@@ -705,6 +809,94 @@ theorem collectLoot_hp_bound {p : PlayerState} {loot : Loot}
   | item item => exact h
   | heal n =>
       exact Nat.min_le_left _ _
+
+/-!
+`step_preserves_validState` 是环境层的总不变量：只要初态玩家在当前房间边界内，
+且 HP 不超过最大值，那么任意合法 `Step` 的终态仍满足这两个条件。碰撞自由
+由移动相关定理单独保证，因为动态桥旋转需要额外的机关安全前提。
+-/
+
+theorem step_preserves_validState
+    {s t : WorldState} {a : Action} {events : List Event}
+    (hvalid : ValidState s)
+    (hstep : Step s a t events) :
+    ValidState t := by
+  cases hstep with
+  | wait =>
+      exact hvalid
+  | movePlain ha hq henter htrap hbutton =>
+      exact ⟨henter.1, hvalid.2⟩
+  | moveButton ha hq henter hbutton hpos =>
+      constructor
+      · simpa [currentRoomState, updateCurrentRoom, setRoom, pressButtonAt]
+          using henter.1
+      · exact hvalid.2
+  | @moveTrapSurvive a d q trap ha hq henter htrap hpos hactive
+      hsurvives hrespawn =>
+      constructor
+      · simp only [currentRoomState_updateCurrentRoom]
+        unfold deactivateTrap
+        split <;> exact hrespawn.1
+      · exact damage_preserves_hp_bound trap.damage hvalid.2
+  | @moveTrapFatal a d q trap ha hq henter htrap hpos hactive hfatal =>
+      constructor
+      · simp only [currentRoomState_updateCurrentRoom]
+        unfold deactivateTrap
+        split <;> exact henter.1
+      · exact damage_preserves_hp_bound trap.damage hvalid.2
+  | moveBlocked ha hblocked =>
+      exact hvalid
+  | faceMonster ha hmonster =>
+      exact hvalid
+  | @openChest chest hmember hvisible hclosed hadj =>
+      constructor
+      · simp only [currentRoomState_updateCurrentRoom]
+        cases chest.loot <;>
+          exact hvalid.1
+      · simpa [updateCurrentRoom] using
+          (collectLoot_hp_bound
+            (p := { s.player with shielding := false })
+            (loot := chest.loot) hvalid.2)
+  | talkNpc hnoChest hmember hadj =>
+      exact hvalid
+  | attackDamage hnoInteraction hsword hmember htarget hpower hsurvives =>
+      constructor
+      · simpa [currentRoomState, updateCurrentRoom, setRoom, replaceMonster]
+          using hvalid.1
+      · exact hvalid.2
+  | @attackKill monster power reward hnoInteraction hsword hmember htarget
+      hpower hkilled =>
+      constructor
+      · simpa [currentRoomState, updateCurrentRoom, setRoom, removeMonster,
+          rewardPlayer]
+          using hvalid.1
+      · exact hvalid.2
+  | shield hshield =>
+      exact hvalid
+  | shieldUnavailable hshield =>
+      exact hvalid
+  | @monsterContact monster hmember hcontact hshield =>
+      exact ⟨hvalid.1, damage_preserves_hp_bound monster.damage hvalid.2⟩
+  | shieldContact hmember hcontact hshield =>
+      exact hvalid
+  | monsterMove hmember hadj henter hfree =>
+      constructor
+      · simpa [currentRoomState, updateCurrentRoom, setRoom, replaceMonster]
+          using hvalid.1
+      · exact hvalid.2
+  | activateSwitch hnoChest hnoNpc hmember hadj hbridge =>
+      constructor
+      · rw [activateSwitchState_current_bounds]
+        exact hvalid.1
+      · exact hvalid.2
+  | useExit hmember hat hfacing hreq htarget hspawn =>
+      constructor
+      · simpa [currentRoomState, htarget] using hspawn.1
+      · exact hvalid.2
+  | exitBlocked hmember hat hfacing hreq =>
+      exact hvalid
+  | completeAllChests hobjective =>
+      exact hvalid
 
 -- 通行性分解：从 canEnter 可以直接推出界内、非墙和非可见宝箱。
 theorem canEnter_inBounds {r : RoomState} {p : Position}
@@ -827,6 +1019,13 @@ theorem trap_respawn_in_bounds {s : WorldState} {trap : Trap}
     inBounds (currentRoomState s).bounds
       ({ damagePlayer s.player trap.damage with pos := trap.respawn }).pos := by
   exact hrespawn.1
+
+theorem fatal_trap_keeps_zero_hp_at_trigger
+    (s : WorldState) (trap : Trap) (q : Position)
+    (hfatal : (damagePlayer s.player trap.damage).hp = 0) :
+    ({ damagePlayer s.player trap.damage with pos := q }).hp = 0 ∧
+    ({ damagePlayer s.player trap.damage with pos := q }).pos = q := by
+  exact ⟨hfatal, rfl⟩
 
 -- 房间切换：成功出口准确写入目标房间和 spawn，完成出口设置 completed。
 theorem successful_exit_enters_target_room (s : WorldState) (exit : Exit) :
@@ -1273,7 +1472,8 @@ theorem task1_completable_if_subplans_exist
       Exec nearChest [.slotA] (stateAfterOpeningChest nearChest chest) :=
     Exec.cons hOpenStep Exec.nil
   have hExitStep :
-      Step atExit .wait (stateAfterUsingExit atExit exit)
+      Step atExit (directionAction exit.direction)
+        (stateAfterUsingExit atExit exit)
         (if exit.completesTask then
           [.doorOpened exit.id, .roomChanged atExit.currentRoom exit.targetRoom,
            .environmentCompleted]
@@ -1282,7 +1482,8 @@ theorem task1_completable_if_subplans_exist
     exact Step.useExit hExitMember hAtExit hFacingExit hRequirement
       hTargetRoom hSpawn
   have hExitExec :
-      Exec atExit [.wait] (stateAfterUsingExit atExit exit) :=
+      Exec atExit [directionAction exit.direction]
+        (stateAfterUsingExit atExit exit) :=
     Exec.cons hExitStep Exec.nil
   subst afterChest
   have hPhase1 :
@@ -1293,7 +1494,9 @@ theorem task1_completable_if_subplans_exist
       Exec initial ((toChest ++ [.slotA]) ++ toExit) atExit :=
     exec_append hPhase1 hToExit
   have hAll :
-      Exec initial (((toChest ++ [.slotA]) ++ toExit) ++ [.wait])
+      Exec initial
+        (((toChest ++ [.slotA]) ++ toExit) ++
+          [directionAction exit.direction])
         (stateAfterUsingExit atExit exit) :=
     exec_append hPhase2 hExitExec
   refine ⟨_, _, hAll, ?_⟩
@@ -1410,7 +1613,7 @@ private theorem task1PublicSafeAt
     h | h | h | h | h | h
   all_goals
     rcases h with ⟨rfl, rfl⟩
-    simp [safeTile, canEnter, inBounds, staticBlocker, visibleChestAt,
+    simp [safeTile, canEnter, inBounds, staticBlocker, npcAt, visibleChestAt,
       activeTrapAt, monsterAt, gapAt, activeBridgeTile, task1PublicRoom,
       task1PublicBounds, task1PublicWalls, task1PublicChest, task1Pos]
 
@@ -1794,7 +1997,8 @@ theorem task2_completable_if_subplans_exist
       Exec nearChest [.slotA] (stateAfterOpeningChest nearChest chest) :=
     Exec.cons hOpenStep Exec.nil
   have hExitStep :
-      Step atExit .wait (stateAfterUsingExit atExit exit)
+      Step atExit (directionAction exit.direction)
+        (stateAfterUsingExit atExit exit)
         (if exit.completesTask then
           [.doorOpened exit.id, .roomChanged atExit.currentRoom exit.targetRoom,
            .environmentCompleted]
@@ -1803,7 +2007,8 @@ theorem task2_completable_if_subplans_exist
     Step.useExit hExitMember hAtExit hFacingExit hRequirement
       hTargetRoom hSpawn
   have hExitExec :
-      Exec atExit [.wait] (stateAfterUsingExit atExit exit) :=
+      Exec atExit [directionAction exit.direction]
+        (stateAfterUsingExit atExit exit) :=
     Exec.cons hExitStep Exec.nil
   subst afterChest
   have hPhase1 :
@@ -1824,7 +2029,7 @@ theorem task2_completable_if_subplans_exist
   have hAll :
       Exec initial
         (((((toMonster ++ combatActions) ++ toChest) ++ [.slotA]) ++ toExit) ++
-          [.wait])
+          [directionAction exit.direction])
         (stateAfterUsingExit atExit exit) :=
     exec_append hPhase4 hExitExec
   refine ⟨_, _, hAll, ?_⟩
@@ -1935,7 +2140,7 @@ private theorem task2PublicSafeAt
   rcases h with h | h | h | h | h
   all_goals
     rcases h with ⟨rfl, rfl⟩
-    simp [safeTile, canEnter, inBounds, staticBlocker, visibleChestAt,
+    simp [safeTile, canEnter, inBounds, staticBlocker, npcAt, visibleChestAt,
       activeTrapAt, monsterAt, gapAt, activeBridgeTile, task2PublicRoom,
       task2PublicBounds, task2PublicTraps, task2PublicTrapPositions,
       task2PublicMonster, task2PublicChest, task2Pos]
@@ -2017,6 +2222,11 @@ theorem task2_public_first_attack_damages :
     Step task2PublicNearMonsterWorld .slotA task2PublicAfterFirstHit
       [.monsterDamaged task2PublicMonster.id] := by
   apply Step.attackDamage (power := 1) (monster := task2PublicMonster)
+  · simp [primaryInteractionAvailable, openChestInteractionAvailable,
+      npcInteractionAvailable, switchInteractionAvailable,
+      task2PublicNearMonsterWorld, task2PublicPlayerAtMonster,
+      task2PublicAttackPosition, task2PublicChest, task2PublicRoom,
+      task2PublicMonster, task2Pos, currentRoomState, adjacent, advance]
   · simp [task2PublicNearMonsterWorld, task2PublicPlayerAtMonster]
   · simp [currentRoomState, task2PublicNearMonsterWorld,
       task2PublicRoom]
@@ -2029,6 +2239,13 @@ theorem task2_public_second_attack_kills :
       [.monsterKilled task2PublicDamagedMonster.id] := by
   apply Step.attackKill
       (monster := task2PublicDamagedMonster) (power := 1) (reward := 1)
+  · simp [primaryInteractionAvailable, openChestInteractionAvailable,
+      npcInteractionAvailable, switchInteractionAvailable,
+      task2PublicAfterFirstHit, task2PublicNearMonsterWorld,
+      task2PublicPlayerAtMonster, task2PublicDamagedMonster,
+      task2PublicMonster, task2PublicAttackPosition, task2PublicChest,
+      task2PublicRoom, task2Pos, currentRoomState,
+      updateCurrentRoom, setRoom, replaceMonster, adjacent, advance]
   · simp [task2PublicAfterFirstHit, task2PublicNearMonsterWorld,
       task2PublicPlayerAtMonster, updateCurrentRoom]
   · simp [task2PublicAfterFirstHit, task2PublicDamagedMonster,
@@ -2078,7 +2295,7 @@ private theorem task2PublicClearedSafeAt
   rcases h with h | h | h | h
   all_goals
     rcases h with ⟨rfl, rfl⟩
-    simp [safeTile, canEnter, inBounds, staticBlocker, visibleChestAt,
+    simp [safeTile, canEnter, inBounds, staticBlocker, npcAt, visibleChestAt,
       activeTrapAt, monsterAt, gapAt, activeBridgeTile,
       task2PublicClearedRoom, task2PublicRoom, task2PublicBounds,
       task2PublicTraps, task2PublicTrapPositions, task2PublicChest,
