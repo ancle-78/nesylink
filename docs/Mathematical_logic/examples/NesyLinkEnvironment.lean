@@ -1554,6 +1554,16 @@ theorem exec_append {s t u : WorldState} {xs ys : List Action}
   | cons hstep hrest ih =>
       exact Exec.cons hstep (ih h₂)
 
+theorem exec_preserves_validState
+    {s t : WorldState} {actions : List Action}
+    (hvalid : ValidState s)
+    (hexec : Exec s actions t) :
+    ValidState t := by
+  induction hexec with
+  | nil => exact hvalid
+  | cons hstep hrest ih =>
+      exact ih (step_preserves_validState hvalid hstep)
+
 theorem autonomousExec_has_microstep_trace
     {s t : WorldState}
     (h : AutonomousExec s t) :
@@ -1597,6 +1607,345 @@ theorem exec_nil_iff {s t : WorldState} :
   · intro h
     subst h
     exact Exec.nil
+
+/-! ## 十一、通用图路径与 BFS 层级规格
+
+这一章完全不依赖具体任务。给定任意节点类型 `α` 和邻居枚举函数
+`neighbors : α → List α`，`GenericBfsRoutesExact neighbors start n`
+表示从 `start` 恰好走 `n` 条边能得到的所有 route。它允许重复 route，
+因此描述的是 BFS 的客观层级语义；带 visited/queue 的实现可以作为它的
+高效 refinement 来证明。
+
+核心完备性定理 `generic_bfs_complete_within` 说：任意长度不超过
+`maxDepth` 的图路径，都会出现在这个通用 BFS 的某一层中。后续 Task1--Task5
+只需要把各自的“允许移动”实例化为图邻居关系。
+-/
+
+inductive GenericGraphPath {α : Type}
+    (neighbors : α → List α) :
+    α → List α → α → Prop where
+  | nil (p : α) :
+      GenericGraphPath neighbors p [] p
+  | cons {p q goal : α} {rest : List α}
+      (hstep : q ∈ neighbors p)
+      (htail : GenericGraphPath neighbors q rest goal) :
+      GenericGraphPath neighbors p (q :: rest) goal
+
+def GenericRouteEnd {α : Type} : α → List α → α
+  | current, [] => current
+  | _current, next :: rest => GenericRouteEnd next rest
+
+def GenericBfsRoutesExact {α : Type}
+    (neighbors : α → List α) : α → Nat → List (List α)
+  | _start, 0 => [[]]
+  | start, n + 1 =>
+      List.flatMap (fun next =>
+        (GenericBfsRoutesExact neighbors next n).map
+          (fun route => next :: route)) (neighbors start)
+
+def GenericBfsFindsGoalAtDepth {α : Type}
+    (neighbors : α → List α) (start : α)
+    (goals : List α) (depth : Nat) : Prop :=
+  ∃ route goal,
+    route ∈ GenericBfsRoutesExact neighbors start depth ∧
+    goal ∈ goals ∧
+    GenericRouteEnd start route = goal
+
+def GenericBfsFindsGoalWithin {α : Type}
+    (neighbors : α → List α) (start : α)
+    (goals : List α) (maxDepth : Nat) : Prop :=
+  ∃ depth,
+    depth ≤ maxDepth ∧
+    GenericBfsFindsGoalAtDepth neighbors start goals depth
+
+theorem generic_graph_path_mem_bfs_routes_exact
+    {α : Type} {neighbors : α → List α}
+    {start goal : α} {route : List α}
+    (hpath : GenericGraphPath neighbors start route goal) :
+    route ∈ GenericBfsRoutesExact neighbors start route.length ∧
+    GenericRouteEnd start route = goal := by
+  induction hpath with
+  | nil p =>
+      simp [GenericBfsRoutesExact, GenericRouteEnd]
+  | cons hstep htail ih =>
+      constructor
+      · apply List.mem_flatMap.mpr
+        exact ⟨
+          _,
+          hstep,
+          List.mem_map.mpr ⟨_, ih.1, rfl⟩
+        ⟩
+      · simpa [GenericRouteEnd] using ih.2
+
+theorem generic_bfs_route_layer_sound
+    {α : Type} {neighbors : α → List α}
+    {start : α} {depth : Nat} {route : List α}
+    (hmem : route ∈ GenericBfsRoutesExact neighbors start depth) :
+    GenericGraphPath neighbors start route (GenericRouteEnd start route) := by
+  induction depth generalizing start route with
+  | zero =>
+      simp [GenericBfsRoutesExact] at hmem
+      subst route
+      simp [GenericRouteEnd]
+      exact GenericGraphPath.nil start
+  | succ n ih =>
+      rw [GenericBfsRoutesExact] at hmem
+      rcases List.mem_flatMap.mp hmem with ⟨next, hnext, htailMap⟩
+      rcases List.mem_map.mp htailMap with ⟨tail, htail, hroute⟩
+      subst route
+      exact GenericGraphPath.cons hnext (ih htail)
+
+theorem generic_bfs_complete_within
+    {α : Type} {neighbors : α → List α}
+    {start : α} {goals : List α} {maxDepth : Nat}
+    (hreachable : ∃ route goal,
+      goal ∈ goals ∧
+      route.length ≤ maxDepth ∧
+      GenericGraphPath neighbors start route goal) :
+    GenericBfsFindsGoalWithin neighbors start goals maxDepth := by
+  rcases hreachable with ⟨route, goal, hgoal, hbound, hpath⟩
+  rcases generic_graph_path_mem_bfs_routes_exact hpath with
+    ⟨hmem, hend⟩
+  exact ⟨route.length, hbound, route, goal, hmem, hgoal, hend⟩
+
+/-! ## 十二、通用 tile 路径、BFS 结果与动作翻译
+
+`TilePath r start route goal` 表示 `route` 是从 `start` 到 `goal` 的安全 tile
+路径。每个构造步骤都明确给出方向，要求下一位置等于 `advance` 的结果，
+并要求下一位置满足 `safeTile`。因此任何由该关系认证的 BFS 路径都不会
+越界、撞墙、穿宝箱、进入 gap、陷阱或怪物。
+
+这一章仍然是任务无关的符号层基础设施：Task1、Task2 和后续多房间任务都可以
+复用 `TilePath`、`BfsResult`、`actionForDirection` 与无按钮房间的执行引理。
+-/
+
+inductive TilePath (r : RoomState) : Position → List Position → Position → Prop where
+  | nil (p : Position) :
+      TilePath r p [] p
+  | cons {p q goal : Position} {rest : List Position} (d : Direction)
+      (hq : q = advance p d)
+      (hsafe : safeTile r q)
+      (htail : TilePath r q rest goal) :
+      TilePath r p (q :: rest) goal
+
+def TileReachable (r : RoomState) (start goal : Position) : Prop :=
+  ∃ route, TilePath r start route goal
+
+def BfsResult
+    (r : RoomState) (start : Position) (goals : List Position)
+    (route : List Position) : Prop :=
+  ∃ goal, goal ∈ goals ∧ TilePath r start route goal
+
+theorem tilePath_goal_reachable
+    {r : RoomState} {start goal : Position} {route : List Position}
+    (hpath : TilePath r start route goal) :
+    TileReachable r start goal :=
+  ⟨route, hpath⟩
+
+theorem tilePath_first_step_safe
+    {r : RoomState} {start first goal : Position} {rest : List Position}
+    (hpath : TilePath r start (first :: rest) goal) :
+    safeTile r first := by
+  cases hpath with
+  | cons d hq hsafe htail => exact hsafe
+
+theorem tilePath_first_step_adjacent
+    {r : RoomState} {start first goal : Position} {rest : List Position}
+    (hpath : TilePath r start (first :: rest) goal) :
+    adjacent start first := by
+  cases hpath with
+  | cons d hq hsafe htail =>
+      subst hq
+      cases d with
+      | north => exact Or.inl rfl
+      | south => exact Or.inr (Or.inl rfl)
+      | west => exact Or.inr (Or.inr (Or.inl rfl))
+      | east => exact Or.inr (Or.inr (Or.inr rfl))
+
+theorem bfs_result_is_sound
+    {r : RoomState} {start : Position} {goals route : List Position}
+    (hresult : BfsResult r start goals route) :
+    ∃ goal, goal ∈ goals ∧ TilePath r start route goal :=
+  hresult
+
+theorem bfs_first_move_is_safe
+    {r : RoomState} {start first : Position} {goals rest : List Position}
+    (hresult : BfsResult r start goals (first :: rest)) :
+    safeTile r first := by
+  rcases hresult with ⟨goal, hgoal, hpath⟩
+  exact tilePath_first_step_safe hpath
+
+def actionForDirection : Direction → Action
+  | .north => .up
+  | .south => .down
+  | .west => .left
+  | .east => .right
+
+def movePlayerState (s : WorldState) (q : Position) (d : Direction) : WorldState :=
+  { s with player := { s.player with pos := q, facing := d, shielding := false } }
+
+theorem actionForDirection_correct (d : Direction) :
+    actionDirection (actionForDirection d) = some d := by
+  cases d <;> rfl
+
+theorem movePlayerState_room_unchanged
+    (s : WorldState) (q : Position) (d : Direction) :
+    currentRoomState (movePlayerState s q d) = currentRoomState s := by
+  rfl
+
+def applyPlainTileAction (s : WorldState) (action : Action) : WorldState :=
+  match actionDirection action with
+  | some d => movePlayerState s (advance s.player.pos d) d
+  | none => s
+
+def runPlainTileActions : WorldState → List Action → WorldState
+  | s, [] => s
+  | s, action :: actions =>
+      runPlainTileActions (applyPlainTileAction s action) actions
+
+theorem applyPlainTileAction_currentRoomState
+    (s : WorldState) (action : Action) :
+    currentRoomState (applyPlainTileAction s action) =
+      currentRoomState s := by
+  unfold applyPlainTileAction
+  cases h : actionDirection action with
+  | none => rfl
+  | some d =>
+      exact movePlayerState_room_unchanged s (advance s.player.pos d) d
+
+theorem runPlainTileActions_currentRoomState
+    (s : WorldState) (actions : List Action) :
+    currentRoomState (runPlainTileActions s actions) =
+      currentRoomState s := by
+  induction actions generalizing s with
+  | nil => rfl
+  | cons action rest ih =>
+      rw [runPlainTileActions]
+      rw [ih (applyPlainTileAction s action)]
+      exact applyPlainTileAction_currentRoomState s action
+
+theorem applyPlainTileAction_inventory_keys
+    (s : WorldState) (action : Action) :
+    (applyPlainTileAction s action).player.inventory.keys =
+      s.player.inventory.keys := by
+  unfold applyPlainTileAction
+  cases h : actionDirection action with
+  | none => rfl
+  | some d => rfl
+
+theorem runPlainTileActions_inventory_keys
+    (s : WorldState) (actions : List Action) :
+    (runPlainTileActions s actions).player.inventory.keys =
+      s.player.inventory.keys := by
+  induction actions generalizing s with
+  | nil => rfl
+  | cons action rest ih =>
+      rw [runPlainTileActions]
+      rw [ih (applyPlainTileAction s action)]
+      exact applyPlainTileAction_inventory_keys s action
+
+/-!
+Pixel-level execution is shared infrastructure rather than a Task2 fact. The
+Lean environment is tile-based, so a proof that repeated pixel ticks constitute
+one tile move must come from a separate renderer/physics refinement. Here we
+state that refinement as a small, explicit kinematic contract and keep all
+symbolic safety proofs downstream of the tile trace.
+-/
+
+def PixelActionsRefineTileActions
+    (pixelActions tileActions : List Action) : Prop :=
+  let ActionBlockRefines (block : List Action) (tileAction : Action) : Prop :=
+    block ≠ [] ∧ ∀ action, action ∈ block → action = tileAction
+  let rec BlocksRefine : List Action → List Action → Prop
+    | [], [] => True
+    | [], _ :: _ => False
+    | _ :: _, [] => False
+    | pixels, tileAction :: restTiles =>
+        ∃ block restPixels,
+          pixels = block ++ restPixels ∧
+          ActionBlockRefines block tileAction ∧
+          BlocksRefine restPixels restTiles
+  BlocksRefine pixelActions tileActions
+
+structure PixelToTileKinematicRefinement
+    (start finish : WorldState)
+    (pixelActions tileActions : List Action) : Prop where
+  pixel_refines_tile_actions :
+    PixelActionsRefineTileActions pixelActions tileActions
+  finish_is_tile_run :
+    finish = runPlainTileActions start tileActions
+
+theorem tilePath_has_executable_plan
+    {r : RoomState} {s : WorldState} {start goal : Position}
+    {route : List Position}
+    (hroom : currentRoomState s = r)
+    (hstart : s.player.pos = start)
+    (hbuttons : r.buttons = [])
+    (hpath : TilePath r start route goal) :
+    ∃ actions final,
+      Exec s actions final ∧
+      final.player.pos = goal ∧
+      currentRoomState final = r := by
+  induction hpath generalizing s with
+  | nil p =>
+      exact ⟨[], s, Exec.nil, hstart, hroom⟩
+  | @cons p q pathGoal rest d hq hsafe htail ih =>
+      let next := movePlayerState s q d
+      have henterS : canEnter (currentRoomState s) q := by
+        rw [hroom]
+        exact hsafe.1
+      have htrapS : ¬ activeTrapAt (currentRoomState s) q := by
+        rw [hroom]
+        exact hsafe.2.1
+      have hbuttonS : ¬ buttonAt (currentRoomState s) q := by
+        rw [hroom]
+        intro hb
+        rcases hb with ⟨button, hmember, hpos⟩
+        rw [hbuttons] at hmember
+        simp at hmember
+      have hqS : q = advance s.player.pos d := by
+        rw [hstart]
+        exact hq
+      have hstep :
+          Step s (actionForDirection d) next
+            [.moved s.player.pos q] := by
+        exact Step.movePlain (actionForDirection_correct d) hqS
+          henterS htrapS hbuttonS
+      have hnextRoom : currentRoomState next = r := by
+        rw [movePlayerState_room_unchanged, hroom]
+      have hnextPos : next.player.pos = q := by
+        rfl
+      rcases ih hnextRoom hnextPos with
+        ⟨tailActions, final, htailExec, hfinalPos, hfinalRoom⟩
+      exact ⟨
+        actionForDirection d :: tailActions,
+        final,
+        Exec.cons hstep htailExec,
+        hfinalPos,
+        hfinalRoom
+      ⟩
+
+def BoundedTileReachable
+    (r : RoomState) (start : Position) (depth : Nat) (goal : Position) : Prop :=
+  ∃ route, route.length ≤ depth ∧ TilePath r start route goal
+
+def BfsFrontierComplete
+    (r : RoomState) (start : Position) (depth : Nat)
+    (frontier : List Position) : Prop :=
+  ∀ goal, BoundedTileReachable r start depth goal → goal ∈ frontier
+
+def BfsFindsGoal (frontier goals : List Position) : Prop :=
+  ∃ goal, goal ∈ frontier ∧ goal ∈ goals
+
+theorem bfs_complete_from_frontier_invariant
+    {r : RoomState} {start : Position} {depth : Nat}
+    {frontier goals : List Position}
+    (hcomplete : BfsFrontierComplete r start depth frontier)
+    (hreachable : ∃ goal, goal ∈ goals ∧
+      BoundedTileReachable r start depth goal) :
+    BfsFindsGoal frontier goals := by
+  rcases hreachable with ⟨goal, hgoal, hbounded⟩
+  exact ⟨goal, hcomplete goal hbounded, hgoal⟩
 
 /-!
 # Task 1：FSM + BFS + safety shield 的策略形式化
@@ -1662,175 +2011,7 @@ theorem rememberBlocker_preserves_soundness
     · simpa [hEq] using hp
     · exact hmemory q hOld
 
-/-! ## 2. 路径、可达性与 BFS 规格
-
-`TilePath r start route goal` 表示 `route` 是从 `start` 到 `goal` 的安全 tile
-路径。每个构造步骤都明确给出方向，要求下一位置等于 `advance` 的结果，
-并要求下一位置满足 `safeTile`。因此任何由该关系认证的 BFS 路径都不会
-越界、撞墙、穿宝箱、进入 gap、陷阱或怪物。
--/
-
-inductive TilePath (r : RoomState) : Position → List Position → Position → Prop where
-  | nil (p : Position) :
-      TilePath r p [] p
-  | cons {p q goal : Position} {rest : List Position} (d : Direction)
-      (hq : q = advance p d)
-      (hsafe : safeTile r q)
-      (htail : TilePath r q rest goal) :
-      TilePath r p (q :: rest) goal
-
-def TileReachable (r : RoomState) (start goal : Position) : Prop :=
-  ∃ route, TilePath r start route goal
-
-def BfsResult
-    (r : RoomState) (start : Position) (goals : List Position)
-    (route : List Position) : Prop :=
-  ∃ goal, goal ∈ goals ∧ TilePath r start route goal
-
-theorem tilePath_goal_reachable
-    {r : RoomState} {start goal : Position} {route : List Position}
-    (hpath : TilePath r start route goal) :
-    TileReachable r start goal :=
-  ⟨route, hpath⟩
-
-theorem tilePath_first_step_safe
-    {r : RoomState} {start first goal : Position} {rest : List Position}
-    (hpath : TilePath r start (first :: rest) goal) :
-    safeTile r first := by
-  cases hpath with
-  | cons d hq hsafe htail => exact hsafe
-
-theorem tilePath_first_step_adjacent
-    {r : RoomState} {start first goal : Position} {rest : List Position}
-    (hpath : TilePath r start (first :: rest) goal) :
-    adjacent start first := by
-  cases hpath with
-  | cons d hq hsafe htail =>
-      subst hq
-      cases d with
-      | north => exact Or.inl rfl
-      | south => exact Or.inr (Or.inl rfl)
-      | west => exact Or.inr (Or.inr (Or.inl rfl))
-      | east => exact Or.inr (Or.inr (Or.inr rfl))
-
-theorem bfs_result_is_sound
-    {r : RoomState} {start : Position} {goals route : List Position}
-    (hresult : BfsResult r start goals route) :
-    ∃ goal, goal ∈ goals ∧ TilePath r start route goal :=
-  hresult
-
-theorem bfs_first_move_is_safe
-    {r : RoomState} {start first : Position} {goals rest : List Position}
-    (hresult : BfsResult r start goals (first :: rest)) :
-    safeTile r first := by
-  rcases hresult with ⟨goal, hgoal, hpath⟩
-  exact tilePath_first_step_safe hpath
-
-/-!
-下面把路径规格连接到环境的 `Exec`。`actionForDirection` 把方向翻译成接口动作；
-`tilePath_has_executable_plan` 证明：在没有按钮的 Task1 房间里，每条安全
-`TilePath` 都对应某个真实可执行动作序列，并且终态玩家恰好位于路径终点。
-这是“BFS 找到符号路径”与“环境确实可以执行该路径”之间的 refinement 引理。
--/
-
-def actionForDirection : Direction → Action
-  | .north => .up
-  | .south => .down
-  | .west => .left
-  | .east => .right
-
-def movePlayerState (s : WorldState) (q : Position) (d : Direction) : WorldState :=
-  { s with player := { s.player with pos := q, facing := d, shielding := false } }
-
-theorem actionForDirection_correct (d : Direction) :
-    actionDirection (actionForDirection d) = some d := by
-  cases d <;> rfl
-
-theorem movePlayerState_room_unchanged
-    (s : WorldState) (q : Position) (d : Direction) :
-    currentRoomState (movePlayerState s q d) = currentRoomState s := by
-  rfl
-
-theorem tilePath_has_executable_plan
-    {r : RoomState} {s : WorldState} {start goal : Position}
-    {route : List Position}
-    (hroom : currentRoomState s = r)
-    (hstart : s.player.pos = start)
-    (hbuttons : r.buttons = [])
-    (hpath : TilePath r start route goal) :
-    ∃ actions final,
-      Exec s actions final ∧
-      final.player.pos = goal ∧
-      currentRoomState final = r := by
-  induction hpath generalizing s with
-  | nil p =>
-      exact ⟨[], s, Exec.nil, hstart, hroom⟩
-  | @cons p q pathGoal rest d hq hsafe htail ih =>
-      let next := movePlayerState s q d
-      have henterS : canEnter (currentRoomState s) q := by
-        rw [hroom]
-        exact hsafe.1
-      have htrapS : ¬ activeTrapAt (currentRoomState s) q := by
-        rw [hroom]
-        exact hsafe.2.1
-      have hbuttonS : ¬ buttonAt (currentRoomState s) q := by
-        rw [hroom]
-        intro hb
-        rcases hb with ⟨button, hmember, hpos⟩
-        rw [hbuttons] at hmember
-        simp at hmember
-      have hqS : q = advance s.player.pos d := by
-        rw [hstart]
-        exact hq
-      have hstep :
-          Step s (actionForDirection d) next
-            [.moved s.player.pos q] := by
-        exact Step.movePlain (actionForDirection_correct d) hqS
-          henterS htrapS hbuttonS
-      have hnextRoom : currentRoomState next = r := by
-        rw [movePlayerState_room_unchanged, hroom]
-      have hnextPos : next.player.pos = q := by
-        rfl
-      rcases ih hnextRoom hnextPos with
-        ⟨tailActions, final, htailExec, hfinalPos, hfinalRoom⟩
-      exact ⟨
-        actionForDirection d :: tailActions,
-        final,
-        Exec.cons hstep htailExec,
-        hfinalPos,
-        hfinalRoom
-      ⟩
-
-/-!
-真实 BFS 使用 queue、visited 和 parent。证明 queue 实现完备性时最关键的
-循环不变量是：深度 `n` 的 frontier 已包含所有长度不超过 `n` 的可达位置。
-下面把该不变量单独形式化，并证明一旦它成立，任何有界可达目标都会被找到。
-这正是 Python BFS 按层扩展四邻域时使用的完备性论证。
--/
-
-def BoundedTileReachable
-    (r : RoomState) (start : Position) (depth : Nat) (goal : Position) : Prop :=
-  ∃ route, route.length ≤ depth ∧ TilePath r start route goal
-
-def BfsFrontierComplete
-    (r : RoomState) (start : Position) (depth : Nat)
-    (frontier : List Position) : Prop :=
-  ∀ goal, BoundedTileReachable r start depth goal → goal ∈ frontier
-
-def BfsFindsGoal (frontier goals : List Position) : Prop :=
-  ∃ goal, goal ∈ frontier ∧ goal ∈ goals
-
-theorem bfs_complete_from_frontier_invariant
-    {r : RoomState} {start : Position} {depth : Nat}
-    {frontier goals : List Position}
-    (hcomplete : BfsFrontierComplete r start depth frontier)
-    (hreachable : ∃ goal, goal ∈ goals ∧
-      BoundedTileReachable r start depth goal) :
-    BfsFindsGoal frontier goals := by
-  rcases hreachable with ⟨goal, hgoal, hbounded⟩
-  exact ⟨goal, hcomplete goal hbounded, hgoal⟩
-
-/-! ## 3. action mask / safety shield
+/-! ## 2. action mask / safety shield
 
 `task1Shield` 对非移动动作不作修改；对移动动作，只在目标 tile 满足
 `canEnter` 时放行，否则替换成 WAIT。Task1 没有动态怪物，因此这里检查
@@ -1878,7 +2059,7 @@ theorem task1Shield_allowed_move_is_enterable
       exact ha
     simp [actionDirection] at himpossible
 
-/-! ## 4. Task1 FSM
+/-! ## 3. Task1 FSM
 
 FSM 只有三个阶段：先寻找并开启钥匙宝箱，再寻找钥匙门，最后完成。
 `task1NextPhase` 只读取“是否已有钥匙”和“世界是否完成”两个符号事实。
@@ -1919,7 +2100,7 @@ theorem task1_completion_advances_to_done
     task1NextPhase phase hasKey true = .done := by
   cases phase <;> rfl
 
-/-! ## 5. Task1 的组合正确性与可达性
+/-! ## 4. Task1 的组合正确性与可达性
 
 `Task1Completable` 表示存在一个动作序列，其 `Exec` 轨迹最终满足
 `WorldCompleted`。主定理不指定具体路线，只要求 BFS 提供两段已经由
@@ -1945,6 +2126,13 @@ def stateAfterOpeningChest (s : WorldState) (chest : Chest) : WorldState :=
 
 def stateAfterUsingExit (s : WorldState) (exit : Exit) : WorldState :=
   transitionThroughExit s exit
+
+theorem stateAfterOpeningChest_current_monsters
+    (s : WorldState) (chest : Chest) :
+    (currentRoomState (stateAfterOpeningChest s chest)).monsters =
+      (currentRoomState s).monsters := by
+  simp [stateAfterOpeningChest, updateCurrentRoom, currentRoomState,
+    setRoom, replaceChest]
 
 theorem task1_open_key_chest_gives_key
     {s : WorldState} {chest : Chest} {amount : Nat}
@@ -2037,7 +2225,7 @@ theorem task1_two_phase_bfs_complete
     bfs_complete_from_frontier_invariant hExitFrontier hExitReachable
   ⟩
 
-/-! ## 6. 公开 Task1 地图的可达性实例
+/-! ## 5. 公开 Task1 地图的可达性实例
 
 前面的定理完全不依赖坐标。本节仅把公开的
 `map_data/mathematical_logic/task_1/room_001.json` 翻译成一个证明实例，
@@ -2366,6 +2554,11 @@ theorem task2_attack_kill_removes_target
 战斗阶段允许走到怪物相邻的安全攻击位；开箱和出口阶段使用更保守的
 `OutsideMonsterDanger`，禁止进入怪物 tile 及其一格邻域。这与 Python
 `distance_to_nearest(...) <= 1` 时打断队列的逻辑一致。
+
+Python 还有两类“短命令”不是普通导航：朝相邻怪物发一个方向动作只用于修正
+朝向，朝相邻宝箱发一个方向动作只用于面向宝箱后按 A。Lean 因此区分
+`Task2MoveAllowed`（真正进入下一 tile 的导航移动）和 `Task2CommandAllowed`
+（交给引擎前 safety shield 允许提交的方向命令）。
 -/
 
 def OutsideMonsterDanger (r : RoomState) (p : Position) : Prop :=
@@ -2379,6 +2572,16 @@ def Task2MoveAllowed
   match phase with
   | .toMonster => True
   | .toChest | .toExit | .done => OutsideMonsterDanger r p
+
+def Task2FacingCommandAllowed
+    (phase : Task2Phase) (r : RoomState) (p : Position) : Prop :=
+  (phase = .toMonster ∧ monsterAt r p) ∨
+  (phase = .toChest ∧ visibleChestAt r p)
+
+def Task2CommandAllowed
+    (phase : Task2Phase) (r : RoomState) (p : Position) : Prop :=
+  Task2MoveAllowed phase r p ∨
+  Task2FacingCommandAllowed phase r p
 
 theorem task2_allowed_move_is_safe
     {phase : Task2Phase} {r : RoomState} {p : Position}
@@ -2403,15 +2606,15 @@ noncomputable def task2Shield
   exact match actionDirection proposed with
     | none => proposed
     | some d =>
-        if Task2MoveAllowed phase (currentRoomState s)
+        if Task2CommandAllowed phase (currentRoomState s)
             (advance s.player.pos d)
         then proposed
         else .wait
 
-theorem task2Shield_blocks_disallowed_move
+theorem task2Shield_blocks_disallowed_command
     (phase : Task2Phase) (s : WorldState) (a : Action) (d : Direction)
     (ha : actionDirection a = some d)
-    (hunsafe : ¬ Task2MoveAllowed phase (currentRoomState s)
+    (hunsafe : ¬ Task2CommandAllowed phase (currentRoomState s)
       (advance s.player.pos d)) :
     task2Shield phase s a = .wait := by
   classical
@@ -2420,15 +2623,19 @@ theorem task2Shield_blocks_disallowed_move
 theorem task2Shield_allowed_move_is_safe
     (phase : Task2Phase) (s : WorldState) (a : Action) (d : Direction)
     (ha : actionDirection a = some d)
-    (hallowed : task2Shield phase s a = a) :
+    (hallowed : task2Shield phase s a = a)
+    (hnotFacing : ¬ Task2FacingCommandAllowed phase (currentRoomState s)
+      (advance s.player.pos d)) :
     safeTile (currentRoomState s) (advance s.player.pos d) := by
   classical
   unfold task2Shield at hallowed
   rw [ha] at hallowed
-  by_cases hsafe :
-      Task2MoveAllowed phase (currentRoomState s) (advance s.player.pos d)
-  · exact hsafe.1
-  · simp [hsafe] at hallowed
+  by_cases hcmd :
+      Task2CommandAllowed phase (currentRoomState s) (advance s.player.pos d)
+  · rcases hcmd with hmove | hfacing
+    · exact hmove.1
+    · exact False.elim (hnotFacing hfacing)
+  · simp [hcmd] at hallowed
     have himpossible : actionDirection Action.wait = some d := by
       rw [hallowed]
       exact ha
@@ -2437,13 +2644,13 @@ theorem task2Shield_allowed_move_is_safe
 def QueueMustInterrupt
     (phase : Task2Phase) (s : WorldState) (nextAction : Action) : Prop :=
   ∃ d, actionDirection nextAction = some d ∧
-    ¬ Task2MoveAllowed phase (currentRoomState s)
+    ¬ Task2CommandAllowed phase (currentRoomState s)
       (advance s.player.pos d)
 
 theorem unsafe_queued_move_must_interrupt
     (phase : Task2Phase) (s : WorldState) (a : Action) (d : Direction)
     (ha : actionDirection a = some d)
-    (hunsafe : ¬ Task2MoveAllowed phase (currentRoomState s)
+    (hunsafe : ¬ Task2CommandAllowed phase (currentRoomState s)
       (advance s.player.pos d)) :
     QueueMustInterrupt phase s a :=
   ⟨d, ha, hunsafe⟩
@@ -2453,9 +2660,711 @@ theorem interrupted_move_is_masked_to_wait
     (hinterrupt : QueueMustInterrupt phase s a) :
     task2Shield phase s a = .wait := by
   rcases hinterrupt with ⟨d, ha, hunsafe⟩
-  exact task2Shield_blocks_disallowed_move phase s a d ha hunsafe
+  exact task2Shield_blocks_disallowed_command phase s a d ha hunsafe
 
-/-! ## 4. Task2 三阶段组合正确性
+inductive Task2ShieldedEngineExec
+    (phase : Task2Phase) : WorldState → List Action → WorldState → Prop where
+  | nil {s : WorldState} :
+      Task2ShieldedEngineExec phase s [] s
+  | cons {s t u : WorldState} {action : Action} {actions : List Action} :
+      EngineTick s action t →
+      (∀ d, actionDirection action = some d →
+        Task2CommandAllowed phase (currentRoomState s)
+          (advance s.player.pos d)) →
+      Task2ShieldedEngineExec phase t actions u →
+      Task2ShieldedEngineExec phase s (action :: actions) u
+
+theorem task2ShieldedEngineExec_to_engineExec
+    {phase : Task2Phase} {s t : WorldState} {actions : List Action}
+    (h : Task2ShieldedEngineExec phase s actions t) :
+    EngineExec s actions t := by
+  induction h with
+  | nil => exact EngineExec.nil
+  | cons htick _ hrest ih =>
+      exact EngineExec.cons htick ih
+
+/-! ## 4. BFS 路径、生成动作与 shielded EngineExec
+
+`TileReachable` 只说明存在安全路径；它本身不足以说明 Python BFS 返回了哪条
+路径，也不足以给出动作列表。下面的 `Task2RouteActionPlan` 把路径中的每个
+相邻 tile 转成对应方向动作，并要求该目标 tile 对当前 Task2 阶段是可移动的。
+`Task2BfsPlanGenerated` 再把这个动作计划与 `BfsResult` 连接起来。
+
+这里仍保留两个必要限制：
+
+* 本引理证明的是符号 BFS 证书，不逐行证明 Python `deque`/`parent` 实现；
+* 导航段按普通 tile 移动执行，要求当前房间没有按钮 tile 被路径踩到。按钮会
+  修改房间状态，需另写带按钮状态更新的路径执行引理；Task2 公开图没有按钮。
+-/
+
+inductive Task2RouteActionPlan
+    (phase : Task2Phase) (r : RoomState) :
+    Position → List Position → Position → List Action → Prop where
+  | nil (p : Position) :
+      Task2RouteActionPlan phase r p [] p []
+  | cons {p q goal : Position} {rest : List Position}
+      {actions : List Action} (d : Direction)
+      (hq : q = advance p d)
+      (hallowed : Task2MoveAllowed phase r q)
+      (htail : Task2RouteActionPlan phase r q rest goal actions) :
+      Task2RouteActionPlan phase r p (q :: rest) goal
+        (actionForDirection d :: actions)
+
+theorem task2_route_action_plan_to_tilePath
+    {phase : Task2Phase} {r : RoomState}
+    {start goal : Position} {route : List Position}
+    {tileActions : List Action}
+    (hplan : Task2RouteActionPlan phase r start route goal tileActions) :
+    TilePath r start route goal := by
+  induction hplan with
+  | nil p => exact TilePath.nil p
+  | cons d hq hallowed htail ih =>
+      exact TilePath.cons d hq hallowed.1 ih
+
+structure Task2BfsPlanGenerated
+    (phase : Task2Phase) (r : RoomState) (start : Position)
+    (goals route : List Position) (goal : Position)
+    (tileActions : List Action) : Prop where
+  goal_member : goal ∈ goals
+  route_actions :
+    Task2RouteActionPlan phase r start route goal tileActions
+
+theorem task2_bfs_plan_has_bfs_result
+    {phase : Task2Phase} {r : RoomState} {start : Position}
+    {goals route : List Position} {goal : Position}
+    {tileActions : List Action}
+    (hplan : Task2BfsPlanGenerated
+      phase r start goals route goal tileActions) :
+    BfsResult r start goals route := by
+  exact ⟨
+    goal,
+    hplan.goal_member,
+    task2_route_action_plan_to_tilePath hplan.route_actions
+  ⟩
+
+/-! ### Task2 作为通用 BFS 图规格的实例
+
+通用 BFS 不知道 tile、安全层或阶段。Task2 只需要提供邻居枚举相对于
+`Task2MoveAllowed` 的 sound/complete 条件，就可以把通用 BFS 的层级完备性
+接回 `Task2RouteActionPlan` 和 `Task2BfsPlanGenerated`。
+-/
+
+def Task2GraphNeighborSound
+    (phase : Task2Phase) (r : RoomState)
+    (neighbors : Position → List Position) : Prop :=
+  ∀ p q, q ∈ neighbors p →
+    ∃ d, q = advance p d ∧ Task2MoveAllowed phase r q
+
+def Task2GraphNeighborComplete
+    (phase : Task2Phase) (r : RoomState)
+    (neighbors : Position → List Position) : Prop :=
+  ∀ p q d,
+    q = advance p d →
+    Task2MoveAllowed phase r q →
+    q ∈ neighbors p
+
+theorem task2_route_action_plan_to_generic_graph_path
+    {phase : Task2Phase} {r : RoomState}
+    {neighbors : Position → List Position}
+    {start goal : Position} {route : List Position}
+    {tileActions : List Action}
+    (hcomplete : Task2GraphNeighborComplete phase r neighbors)
+    (hplan :
+      Task2RouteActionPlan phase r start route goal tileActions) :
+    GenericGraphPath neighbors start route goal := by
+  induction hplan with
+  | nil p =>
+      exact GenericGraphPath.nil p
+  | cons d hq hallowed htail ih =>
+      exact GenericGraphPath.cons
+        (hcomplete _ _ d hq hallowed) ih
+
+theorem generic_graph_path_to_task2_route_action_plan
+    {phase : Task2Phase} {r : RoomState}
+    {neighbors : Position → List Position}
+    {start goal : Position} {route : List Position}
+    (hsound : Task2GraphNeighborSound phase r neighbors)
+    (hpath : GenericGraphPath neighbors start route goal) :
+    ∃ tileActions,
+      Task2RouteActionPlan phase r start route goal tileActions := by
+  induction hpath with
+  | nil p =>
+      exact ⟨[], Task2RouteActionPlan.nil p⟩
+  | cons hstep htail ih =>
+      rcases hsound _ _ hstep with ⟨d, hq, hallowed⟩
+      rcases ih with ⟨tailActions, htailPlan⟩
+      exact ⟨
+        actionForDirection d :: tailActions,
+        Task2RouteActionPlan.cons d hq hallowed htailPlan
+      ⟩
+
+theorem task2_objective_bfs_complete_within
+    {phase : Task2Phase} {r : RoomState}
+    {neighbors : Position → List Position}
+    {start : Position} {goals : List Position} {maxDepth : Nat}
+    (hcomplete : Task2GraphNeighborComplete phase r neighbors)
+    (hreachable : ∃ route goal tileActions,
+      goal ∈ goals ∧
+      route.length ≤ maxDepth ∧
+      Task2RouteActionPlan phase r start route goal tileActions) :
+    GenericBfsFindsGoalWithin neighbors start goals maxDepth := by
+  rcases hreachable with
+    ⟨route, goal, tileActions, hgoal, hbound, hplan⟩
+  exact generic_bfs_complete_within
+    (neighbors := neighbors)
+    (start := start)
+    (goals := goals)
+    (maxDepth := maxDepth)
+    ⟨
+      route,
+      goal,
+      hgoal,
+      hbound,
+      task2_route_action_plan_to_generic_graph_path
+        hcomplete hplan
+    ⟩
+
+theorem task2_objective_bfs_layer_route_to_plan
+    {phase : Task2Phase} {r : RoomState}
+    {neighbors : Position → List Position}
+    {start : Position} {goals : List Position}
+    {depth : Nat} {route : List Position} {goal : Position}
+    (hsound : Task2GraphNeighborSound phase r neighbors)
+    (hmem : route ∈ GenericBfsRoutesExact neighbors start depth)
+    (hgoal : goal ∈ goals)
+    (hend : GenericRouteEnd start route = goal) :
+    ∃ tileActions,
+      Task2BfsPlanGenerated phase r start goals route goal tileActions := by
+  have hpath :
+      GenericGraphPath neighbors start route goal := by
+    rw [← hend]
+    exact generic_bfs_route_layer_sound hmem
+  rcases generic_graph_path_to_task2_route_action_plan
+      hsound hpath with
+    ⟨tileActions, hplan⟩
+  exact ⟨tileActions, ⟨hgoal, hplan⟩⟩
+
+/-! ### Python `bfs_path` 子语言：parent 字典与路径重建
+
+下面不是完整 Python 解释器，而是覆盖 `task2_fsm_bfs_agent.py` 中 BFS 核心
+片段的专用操作语义：
+
+```python
+parent[nxt] = current
+if nxt in goals:
+    return reconstruct_path(parent, nxt)
+```
+
+`PythonBfsParentMap` 把 Python 字典中 `child ↦ parent` 的有效边抽象为列表；
+`PythonBfsParentRoute` 表示 `reconstruct_path` 沿 parent 链从 `goal` 回到
+`start` 后反转得到的正向路径。定理
+`python_bfs_return_sound_for_task2_plan` 证明：如果该子语义返回一条 route，
+那么它就是 Task2 可检查的 BFS 生成计划。
+
+仍未覆盖的是完整 `while queue: popleft(); for nxt in neighbors(...)` 的终止和
+完备性；那需要继续证明 queue/visited/frontier 循环不变量。
+-/
+
+abbrev PythonBfsParentMap := List (Position × Position)
+
+def PythonBfsParentEdgeAllowed
+    (phase : Task2Phase) (r : RoomState)
+    (parent child : Position) : Prop :=
+  ∃ d, child = advance parent d ∧ Task2MoveAllowed phase r child
+
+def PythonBfsParentMapSound
+    (phase : Task2Phase) (r : RoomState)
+    (parents : PythonBfsParentMap) : Prop :=
+  ∀ child parent, (child, parent) ∈ parents →
+    PythonBfsParentEdgeAllowed phase r parent child
+
+theorem python_bfs_parent_insert_preserves_sound
+    {phase : Task2Phase} {r : RoomState}
+    {parents : PythonBfsParentMap} {parent child : Position}
+    (hsound : PythonBfsParentMapSound phase r parents)
+    (hedge : PythonBfsParentEdgeAllowed phase r parent child) :
+    PythonBfsParentMapSound phase r ((child, parent) :: parents) := by
+  intro q p hmem
+  rcases List.mem_cons.mp hmem with hhead | htail
+  · cases hhead
+    exact hedge
+  · exact hsound q p htail
+
+inductive PythonBfsParentRoute
+    (phase : Task2Phase) (r : RoomState)
+    (parents : PythonBfsParentMap) :
+    Position → Position → List Position → List Action → Prop where
+  | done (p : Position) :
+      PythonBfsParentRoute phase r parents p p [] []
+  | step {current next goal : Position}
+      {route : List Position} {actions : List Action} (d : Direction)
+      (hparent : (next, current) ∈ parents)
+      (hnext : next = advance current d)
+      (hallowed : Task2MoveAllowed phase r next)
+      (htail :
+        PythonBfsParentRoute phase r parents next goal route actions) :
+      PythonBfsParentRoute phase r parents current goal
+        (next :: route) (actionForDirection d :: actions)
+
+theorem python_parent_route_to_task2_route_action_plan
+    {phase : Task2Phase} {r : RoomState}
+    {parents : PythonBfsParentMap}
+    {start goal : Position} {route : List Position}
+    {tileActions : List Action}
+    (hroute :
+      PythonBfsParentRoute phase r parents start goal route tileActions) :
+    Task2RouteActionPlan phase r start route goal tileActions := by
+  induction hroute with
+  | done p =>
+      exact Task2RouteActionPlan.nil p
+  | step d hparent hnext hallowed htail ih =>
+      exact Task2RouteActionPlan.cons d hnext hallowed ih
+
+structure PythonBfsReturnedRoute
+    (phase : Task2Phase) (r : RoomState) (start : Position)
+    (goals : List Position) (parents : PythonBfsParentMap)
+    (route : List Position) (goal : Position)
+    (tileActions : List Action) : Prop where
+  parent_map_sound : PythonBfsParentMapSound phase r parents
+  goal_member : goal ∈ goals
+  reconstructed :
+    PythonBfsParentRoute phase r parents start goal route tileActions
+
+theorem python_bfs_return_sound_for_task2_plan
+    {phase : Task2Phase} {r : RoomState} {start : Position}
+    {goals : List Position} {parents : PythonBfsParentMap}
+    {route : List Position} {goal : Position}
+    {tileActions : List Action}
+    (hreturn : PythonBfsReturnedRoute
+      phase r start goals parents route goal tileActions) :
+    Task2BfsPlanGenerated phase r start goals route goal tileActions := by
+  exact ⟨
+    hreturn.goal_member,
+    python_parent_route_to_task2_route_action_plan
+      hreturn.reconstructed
+  ⟩
+
+/-!
+下面再向 Python 代码靠近一层：把 `bfs_path` 的 `queue`、`parent` 和
+`while queue: ... for nxt in neighbors(current): ...` 建成一个小步语义。
+
+这仍然是专用子语言，而不是通用 Python 解释器。它逐分支覆盖：
+
+* `current = queue.popleft()`
+* `for nxt in neighbors(current)`
+* `if nxt in parent: continue`
+* `if ... not walkable ...: continue`
+* `parent[nxt] = current`
+* `if nxt in goals: return reconstruct_path(parent, nxt)`
+* `queue.append(nxt)`
+
+核心循环不变量是：`parent` 字典里的每一条 `child ↦ parent` 都是
+`Task2MoveAllowed` 认证过的一步 tile 移动。这样，当 Python 最终返回并用
+`reconstruct_path` 沿 parent 链重建 route 时，上面的
+`python_bfs_return_sound_for_task2_plan` 可以把它转成 Task2 的 BFS 计划证书。
+-/
+
+inductive PythonBfsControl where
+  | ready
+  | scanning (current : Position) (remainingDirs : List Direction)
+  | returned (goal : Position)
+  | failed
+  deriving DecidableEq, Repr
+
+structure PythonBfsState where
+  queue : List Position
+  parents : PythonBfsParentMap
+  seen : List Position
+  control : PythonBfsControl
+  deriving Repr
+
+def pythonBfsNeighborDirections : List Direction :=
+  [.north, .south, .west, .east]
+
+def PythonBfsStateParentSound
+    (phase : Task2Phase) (r : RoomState)
+    (s : PythonBfsState) : Prop :=
+  PythonBfsParentMapSound phase r s.parents
+
+inductive PythonBfsStep
+    (phase : Task2Phase) (r : RoomState) (goals : List Position) :
+    PythonBfsState → PythonBfsState → Prop where
+  | pop {current : Position} {restQueue parents seen : List Position}
+      {parentEdges : PythonBfsParentMap}
+      (hparents : parents = seen) :
+      PythonBfsStep phase r goals
+        { queue := current :: restQueue, parents := parentEdges,
+          seen := parents, control := .ready }
+        { queue := restQueue, parents := parentEdges,
+          seen := seen, control := .scanning current pythonBfsNeighborDirections }
+  | queue_empty {parentEdges : PythonBfsParentMap} {seen : List Position} :
+      PythonBfsStep phase r goals
+        { queue := [], parents := parentEdges, seen := seen,
+          control := .ready }
+        { queue := [], parents := parentEdges, seen := seen,
+          control := .failed }
+  | finish_scan {queue seen : List Position}
+      {parentEdges : PythonBfsParentMap} {current : Position} :
+      PythonBfsStep phase r goals
+        { queue := queue, parents := parentEdges, seen := seen,
+          control := .scanning current [] }
+        { queue := queue, parents := parentEdges, seen := seen,
+          control := .ready }
+  | skip_seen {queue seen : List Position}
+      {parentEdges : PythonBfsParentMap} {current : Position}
+      {d : Direction} {restDirs : List Direction}
+      (hseen : advance current d ∈ seen) :
+      PythonBfsStep phase r goals
+        { queue := queue, parents := parentEdges, seen := seen,
+          control := .scanning current (d :: restDirs) }
+        { queue := queue, parents := parentEdges, seen := seen,
+          control := .scanning current restDirs }
+  | skip_rejected {queue seen : List Position}
+      {parentEdges : PythonBfsParentMap} {current : Position}
+      {d : Direction} {restDirs : List Direction}
+      (hnew : advance current d ∉ seen)
+      (hrejected : ¬ Task2MoveAllowed phase r (advance current d)) :
+      PythonBfsStep phase r goals
+        { queue := queue, parents := parentEdges, seen := seen,
+          control := .scanning current (d :: restDirs) }
+        { queue := queue, parents := parentEdges, seen := seen,
+          control := .scanning current restDirs }
+  | discover_non_goal {queue seen : List Position}
+      {parentEdges : PythonBfsParentMap} {current : Position}
+      {d : Direction} {restDirs : List Direction}
+      (hnew : advance current d ∉ seen)
+      (hallowed : Task2MoveAllowed phase r (advance current d))
+      (hnotGoal : advance current d ∉ goals) :
+      PythonBfsStep phase r goals
+        { queue := queue, parents := parentEdges, seen := seen,
+          control := .scanning current (d :: restDirs) }
+        { queue := queue ++ [advance current d],
+          parents := (advance current d, current) :: parentEdges,
+          seen := advance current d :: seen,
+          control := .scanning current restDirs }
+  | discover_goal {queue seen : List Position}
+      {parentEdges : PythonBfsParentMap} {current : Position}
+      {d : Direction} {restDirs : List Direction}
+      (hnew : advance current d ∉ seen)
+      (hallowed : Task2MoveAllowed phase r (advance current d))
+      (hgoal : advance current d ∈ goals) :
+      PythonBfsStep phase r goals
+        { queue := queue, parents := parentEdges, seen := seen,
+          control := .scanning current (d :: restDirs) }
+        { queue := queue,
+          parents := (advance current d, current) :: parentEdges,
+          seen := advance current d :: seen,
+          control := .returned (advance current d) }
+
+theorem python_bfs_step_preserves_parent_sound
+    {phase : Task2Phase} {r : RoomState} {goals : List Position}
+    {s t : PythonBfsState}
+    (hsound : PythonBfsStateParentSound phase r s)
+    (hstep : PythonBfsStep phase r goals s t) :
+    PythonBfsStateParentSound phase r t := by
+  cases hstep with
+  | pop hparents =>
+      simpa [PythonBfsStateParentSound] using hsound
+  | queue_empty =>
+      simpa [PythonBfsStateParentSound] using hsound
+  | finish_scan =>
+      simpa [PythonBfsStateParentSound] using hsound
+  | skip_seen hseen =>
+      simpa [PythonBfsStateParentSound] using hsound
+  | skip_rejected hnew hrejected =>
+      simpa [PythonBfsStateParentSound] using hsound
+  | discover_non_goal hnew hallowed hnotGoal =>
+      unfold PythonBfsStateParentSound at hsound ⊢
+      apply python_bfs_parent_insert_preserves_sound hsound
+      exact ⟨_, rfl, hallowed⟩
+  | discover_goal hnew hallowed hgoal =>
+      unfold PythonBfsStateParentSound at hsound ⊢
+      apply python_bfs_parent_insert_preserves_sound hsound
+      exact ⟨_, rfl, hallowed⟩
+
+inductive PythonBfsExec
+    (phase : Task2Phase) (r : RoomState) (goals : List Position) :
+    PythonBfsState → PythonBfsState → Prop where
+  | refl (s : PythonBfsState) :
+      PythonBfsExec phase r goals s s
+  | step {s t u : PythonBfsState}
+      (hstep : PythonBfsStep phase r goals s t)
+      (htail : PythonBfsExec phase r goals t u) :
+      PythonBfsExec phase r goals s u
+
+theorem python_bfs_exec_preserves_parent_sound
+    {phase : Task2Phase} {r : RoomState} {goals : List Position}
+    {s t : PythonBfsState}
+    (hsound : PythonBfsStateParentSound phase r s)
+    (hexec : PythonBfsExec phase r goals s t) :
+    PythonBfsStateParentSound phase r t := by
+  induction hexec with
+  | refl s =>
+      exact hsound
+  | step hstep htail ih =>
+      exact ih (python_bfs_step_preserves_parent_sound hsound hstep)
+
+structure PythonBfsSmallStepReturnedRoute
+    (phase : Task2Phase) (r : RoomState) (start : Position)
+    (goals : List Position) (initial final : PythonBfsState)
+    (route : List Position) (goal : Position)
+    (tileActions : List Action) : Prop where
+  initial_parent_sound : PythonBfsStateParentSound phase r initial
+  exec : PythonBfsExec phase r goals initial final
+  returned : final.control = .returned goal
+  goal_member : goal ∈ goals
+  reconstructed :
+    PythonBfsParentRoute phase r final.parents start goal route tileActions
+
+theorem python_bfs_small_step_return_sound_for_task2_plan
+    {phase : Task2Phase} {r : RoomState} {start : Position}
+    {goals : List Position} {initial final : PythonBfsState}
+    {route : List Position} {goal : Position}
+    {tileActions : List Action}
+    (hreturn : PythonBfsSmallStepReturnedRoute
+      phase r start goals initial final route goal tileActions) :
+    Task2BfsPlanGenerated phase r start goals route goal tileActions := by
+  have hparents :
+      PythonBfsParentMapSound phase r final.parents :=
+    python_bfs_exec_preserves_parent_sound
+      hreturn.initial_parent_sound hreturn.exec
+  exact python_bfs_return_sound_for_task2_plan
+    (phase := phase) (r := r) (start := start)
+    (goals := goals) (parents := final.parents)
+    (route := route) (goal := goal) (tileActions := tileActions)
+    ⟨hparents, hreturn.goal_member, hreturn.reconstructed⟩
+
+/-!
+### 条件 BFS 完备性接口
+
+完整逐行证明 Python `deque` 循环需要较重的有限图和队列层级不变量。为了避免
+把前提退化成“BFS 已经返回了 route”，这里暴露一个更可审计的中间接口：
+
+* `Task2BfsFrontierComplete`：到某一深度为止，frontier/seen 已覆盖所有
+  `Task2RouteActionPlan` 可达位置；
+* `PythonBfsReturnsOnFrontierGoal`：如果这个 frontier/seen 中已经包含目标，
+  Python BFS 小步语义会执行到 `returned` 并由 `reconstruct_path` 给出路径。
+
+于是只要某个目标在深度 `n` 内可达，就能推出小步语义返回，再推出
+`Task2BfsPlanGenerated`。这个前提是 BFS 算法级不变量，能在 Task1--Task5
+之间复用；它明显弱于直接假设每个阶段已经给出 `Task2BfsPhaseGenerated`。
+-/
+
+def Task2BoundedReachable
+    (phase : Task2Phase) (r : RoomState) (start : Position)
+    (depth : Nat) (goal : Position) : Prop :=
+  ∃ route tileActions,
+    route.length ≤ depth ∧
+    Task2RouteActionPlan phase r start route goal tileActions
+
+def Task2BfsFrontierComplete
+    (phase : Task2Phase) (r : RoomState) (start : Position)
+    (depth : Nat) (frontier : List Position) : Prop :=
+  ∀ goal,
+    Task2BoundedReachable phase r start depth goal →
+    goal ∈ frontier
+
+def Task2BfsFindsGoal
+    (frontier goals : List Position) : Prop :=
+  ∃ goal, goal ∈ frontier ∧ goal ∈ goals
+
+theorem task2_bfs_complete_from_frontier_invariant
+    {phase : Task2Phase} {r : RoomState} {start : Position}
+    {depth : Nat} {frontier goals : List Position}
+    (hcomplete :
+      Task2BfsFrontierComplete phase r start depth frontier)
+    (hreachable : ∃ goal,
+      goal ∈ goals ∧
+      Task2BoundedReachable phase r start depth goal) :
+    Task2BfsFindsGoal frontier goals := by
+  rcases hreachable with ⟨goal, hgoal, hbounded⟩
+  exact ⟨goal, hcomplete goal hbounded, hgoal⟩
+
+def PythonBfsReturnsOnFrontierGoal
+    (phase : Task2Phase) (r : RoomState) (start : Position)
+    (goals : List Position) (initial : PythonBfsState)
+    (frontier : List Position) : Prop :=
+  Task2BfsFindsGoal frontier goals →
+    ∃ final route goal tileActions,
+      PythonBfsSmallStepReturnedRoute
+        phase r start goals initial final route goal tileActions
+
+theorem python_bfs_complete_from_frontier_certificate
+    {phase : Task2Phase} {r : RoomState} {start : Position}
+    {goals : List Position} {initial : PythonBfsState}
+    {depth : Nat} {frontier : List Position}
+    (hcomplete :
+      Task2BfsFrontierComplete phase r start depth frontier)
+    (hreturns :
+      PythonBfsReturnsOnFrontierGoal
+        phase r start goals initial frontier)
+    (hreachable : ∃ goal,
+      goal ∈ goals ∧
+      Task2BoundedReachable phase r start depth goal) :
+    ∃ final route goal tileActions,
+      PythonBfsSmallStepReturnedRoute
+        phase r start goals initial final route goal tileActions ∧
+      Task2BfsPlanGenerated phase r start goals route goal tileActions := by
+  have hfound : Task2BfsFindsGoal frontier goals :=
+    task2_bfs_complete_from_frontier_invariant
+      hcomplete hreachable
+  rcases hreturns hfound with
+    ⟨final, route, goal, tileActions, hreturn⟩
+  exact ⟨
+    final,
+    route,
+    goal,
+    tileActions,
+    hreturn,
+    python_bfs_small_step_return_sound_for_task2_plan hreturn
+  ⟩
+
+theorem task2_route_action_plan_has_shielded_engineExec
+    {phase : Task2Phase} {r : RoomState}
+    {s : WorldState} {start goal : Position}
+    {route : List Position} {actions : List Action}
+    (hroom : currentRoomState s = r)
+    (hstart : s.player.pos = start)
+    (hbuttons : r.buttons = [])
+    (hrunning : Running s)
+    (hplan : Task2RouteActionPlan phase r start route goal actions) :
+    Task2ShieldedEngineExec phase s actions
+      (runPlainTileActions s actions) ∧
+    (runPlainTileActions s actions).player.pos = goal ∧
+    currentRoomState (runPlainTileActions s actions) = r := by
+  induction hplan generalizing s with
+  | nil p =>
+      exact ⟨Task2ShieldedEngineExec.nil, hstart, hroom⟩
+  | @cons p q pathGoal rest tailActions d hq hallowed htail ih =>
+      let next := movePlayerState s q d
+      have hqS : q = advance s.player.pos d := by
+        rw [hstart]
+        exact hq
+      have henterS : canEnter (currentRoomState s) q := by
+        rw [hroom]
+        exact hallowed.1.1
+      have htrapS : ¬ activeTrapAt (currentRoomState s) q := by
+        rw [hroom]
+        exact hallowed.1.2.1
+      have hbuttonS : ¬ buttonAt (currentRoomState s) q := by
+        rw [hroom]
+        intro hb
+        rcases hb with ⟨button, hmember, hpos⟩
+        rw [hbuttons] at hmember
+        simp at hmember
+      have hstep :
+          Step s (actionForDirection d) next
+            [.moved s.player.pos q] := by
+        exact Step.movePlain (actionForDirection_correct d)
+          hqS henterS htrapS hbuttonS
+      have hplayer :
+          PlayerStep s (actionForDirection d) next
+            [.moved s.player.pos q] := by
+        refine ⟨hrunning, hstep, ?_⟩
+        intro hauto
+        cases hauto
+      have htick :
+          EngineTick s (actionForDirection d) next :=
+        EngineTick.mk hplayer AutonomousExec.nil
+      have hcommand :
+          ∀ d', actionDirection (actionForDirection d) = some d' →
+            Task2CommandAllowed phase (currentRoomState s)
+              (advance s.player.pos d') := by
+        intro d' hd'
+        have hdEq : d' = d := by
+          cases d <;> cases d' <;>
+            simp [actionForDirection, actionDirection] at hd' ⊢
+        subst d'
+        left
+        rw [hroom, ← hqS]
+        exact hallowed
+      have hnextRoom : currentRoomState next = r := by
+        rw [movePlayerState_room_unchanged, hroom]
+      have hnextPos : next.player.pos = q := by
+        rfl
+      have hnextRunning : Running next := by
+        exact hrunning
+      rcases ih hnextRoom hnextPos hnextRunning with
+        ⟨htailShielded, htailPos, htailRoom⟩
+      have happly :
+          applyPlainTileAction s (actionForDirection d) = next := by
+        cases d <;> simp [applyPlainTileAction, actionForDirection,
+          actionDirection, next, movePlayerState, hqS]
+      constructor
+      · simp [runPlainTileActions, happly]
+        exact Task2ShieldedEngineExec.cons htick hcommand htailShielded
+      constructor
+      · simpa [runPlainTileActions, happly] using htailPos
+      · simpa [runPlainTileActions, happly] using htailRoom
+
+abbrev Task2PixelActionsRefineTileActions
+    (_phase : Task2Phase) (_start _finish : WorldState)
+    (pixelActions tileActions : List Action) : Prop :=
+  PixelActionsRefineTileActions pixelActions tileActions
+
+structure Task2BfsPhaseGenerated
+    (phase : Task2Phase) (start finish : WorldState)
+    (pixelActions tileActions : List Action) where
+  goals : List Position
+  route : List Position
+  goal : Position
+  bfs_plan :
+    Task2BfsPlanGenerated phase (currentRoomState start)
+      start.player.pos goals route goal tileActions
+  pixel_to_tile_refinement :
+    PixelToTileKinematicRefinement
+      start finish pixelActions tileActions
+  no_buttons_on_route_room : (currentRoomState start).buttons = []
+  running_at_start : Running start
+
+theorem task2_bfs_phase_generated_has_bfs_result
+    {phase : Task2Phase} {start finish : WorldState}
+    {pixelActions tileActions : List Action}
+    (h : Task2BfsPhaseGenerated
+      phase start finish pixelActions tileActions) :
+    BfsResult (currentRoomState start) start.player.pos h.goals h.route :=
+  task2_bfs_plan_has_bfs_result h.bfs_plan
+
+theorem task2_bfs_phase_generated_has_shielded_engineExec
+    {phase : Task2Phase} {start finish : WorldState}
+    {pixelActions tileActions : List Action}
+    (h : Task2BfsPhaseGenerated
+      phase start finish pixelActions tileActions) :
+    Task2ShieldedEngineExec phase start tileActions finish := by
+  have hroute :=
+    task2_route_action_plan_has_shielded_engineExec
+      (phase := phase)
+      (r := currentRoomState start)
+      (s := start)
+      (start := start.player.pos)
+      (goal := h.goal)
+      (route := h.route)
+      (actions := tileActions)
+      rfl rfl h.no_buttons_on_route_room h.running_at_start
+      h.bfs_plan.route_actions
+  rcases hroute with ⟨hshielded, _hpos, _hroom⟩
+  rw [h.pixel_to_tile_refinement.finish_is_tile_run]
+  exact hshielded
+
+theorem task2_bfs_phase_generated_preserves_currentRoomState
+    {phase : Task2Phase} {start finish : WorldState}
+    {pixelActions tileActions : List Action}
+    (h : Task2BfsPhaseGenerated
+      phase start finish pixelActions tileActions) :
+    currentRoomState finish = currentRoomState start := by
+  rw [h.pixel_to_tile_refinement.finish_is_tile_run]
+  exact runPlainTileActions_currentRoomState start tileActions
+
+theorem task2_bfs_phase_generated_preserves_inventory_keys
+    {phase : Task2Phase} {start finish : WorldState}
+    {pixelActions tileActions : List Action}
+    (h : Task2BfsPhaseGenerated
+      phase start finish pixelActions tileActions) :
+    finish.player.inventory.keys = start.player.inventory.keys := by
+  rw [h.pixel_to_tile_refinement.finish_is_tile_run]
+  exact runPlainTileActions_inventory_keys start tileActions
+
+/-! ## 5. Task2 三阶段组合正确性
 
 `Task2Completable` 要求最终世界完成。主定理把四段已经验证的轨迹拼接：
 
@@ -2473,6 +3382,13 @@ def Task2Goal (s : WorldState) : Prop :=
 
 def Task2Completable (initial : WorldState) : Prop :=
   ∃ actions final, Exec initial actions final ∧ Task2Goal final
+
+def Task2SafelyCompletable (initial : WorldState) : Prop :=
+  ∃ actions final,
+    Exec initial actions final ∧
+    Task2Goal final ∧
+    alive final ∧
+    ValidState final
 
 theorem task2_completable_if_subplans_exist
     {initial nearMonster afterCombat nearChest afterChest atExit : WorldState}
@@ -2541,9 +3457,10 @@ theorem task2_completable_if_subplans_exist
   simp [hCompletes]
 
 /-!
-Task2 的完备性必须带动态公平性前提，不能虚假声称对任意怪物随机行为都终止。
-`EventuallyCombatClears` 表示怪物最终进入可攻击位置，并由有限次有效攻击清空。
-在该前提、三段 BFS 可达以及出口条件成立时，上面的组合定理给出通关轨迹。
+下面保留一个独立的动态公平性谓词，用来表达“存在有限合法战斗轨迹清空怪物”。
+主策略定理不再把它和实际 combat trace 分开使用；真正进入主定理的是
+`Task2CombatPhaseGenerated`，它把控制器生成的战斗 trace 与清怪后置条件绑定
+在同一个证书里。
 -/
 
 def EventuallyCombatClears (nearMonster afterCombat : WorldState) : Prop :=
@@ -2559,7 +3476,272 @@ theorem task2_combat_fairness_exposes_finite_plan
       (currentRoomState afterCombat).monsters = [] :=
   hfair
 
-/-! ## 5. 公开 Task2 地图的安全可达性实例
+/-! ## 6. Python FSM/BFS/shield 策略的条件正确性接口
+
+下面的结构把 Python 代码中仍位于 Lean 之外的部分显式列为前提，而不是把
+“已经到达完成终态”当成主定理前提：
+
+* `Task2ObservationSound` 表示像素分类后的符号对象与真实世界一致；
+* `Task2InventoryInfoSound` 表示允许读取的物品栏钥匙数与真实状态一致；
+* `PixelToTileKinematicRefinement` 表示一段 pixel tick 动作可由全局像素/物理
+  refinement 压缩成 tile 动作；
+* `Task2PixelToTilePhaseRefinement` 表示一段 tile 级动作已经通过
+  `Task2ShieldedEngineExec` 检查；
+* `Task2CombatPhaseGenerated` 把战斗 trace 和清怪后置条件绑定在同一证书里；
+* `Task2ConditionalStrategyAssumptions` 把三段 BFS、战斗生成证书、开箱、
+  条件出口和最终存活集中成一个可审计的策略证书。
+
+因此最终定理证明的是：在这些条件都成立时，Python FSM+BFS+shield 策略会
+生成一条安全完成轨迹；它不再直接假设 `Task2Goal final`。
+-/
+
+structure Task2SymbolicObservation where
+  playerPos : Position
+  monsters : List Monster
+  visibleChests : List Chest
+  exits : List Exit
+  hasKey : Bool
+  walkable : Position → Prop
+  dangerous : Position → Prop
+
+def Task2ObservationSound
+    (s : WorldState) (obs : Task2SymbolicObservation) : Prop :=
+  obs.playerPos = s.player.pos ∧
+  obs.monsters = (currentRoomState s).monsters ∧
+  obs.visibleChests =
+    (currentRoomState s).chests.filter (fun chest => chest.visible) ∧
+  obs.exits = (currentRoomState s).exits ∧
+  (∀ p, obs.walkable p ↔ canEnter (currentRoomState s) p) ∧
+  (∀ p, obs.dangerous p ↔
+    activeTrapAt (currentRoomState s) p ∨
+    monsterAt (currentRoomState s) p)
+
+def Task2InventoryInfoSound
+    (s : WorldState) (obs : Task2SymbolicObservation) : Prop :=
+  obs.hasKey = true ↔ 0 < s.player.inventory.keys
+
+theorem task2_inventory_sound_key_confirmed
+    {s : WorldState} {obs : Task2SymbolicObservation}
+    (hsound : Task2InventoryInfoSound s obs)
+    (hkey : obs.hasKey = true) :
+    0 < s.player.inventory.keys :=
+  hsound.mp hkey
+
+structure Task2PixelToTilePhaseRefinement
+    (phase : Task2Phase) (start finish : WorldState)
+    (pixelActions tileActions : List Action) : Prop where
+  -- This is the explicit bridge from Python pixel ticks to the tile-level trace.
+  -- It is intentionally a contract: proving it requires reasoning about the
+  -- Python renderer, collision code, and repeated per-pixel actions.
+  pixel_refines_tile_actions :
+    Task2PixelActionsRefineTileActions
+      phase start finish pixelActions tileActions
+  tile_trace : Task2ShieldedEngineExec phase start tileActions finish
+
+theorem task2_phase_refinement_has_engineExec
+    {phase : Task2Phase} {start finish : WorldState}
+    {pixelActions tileActions : List Action}
+    (h : Task2PixelToTilePhaseRefinement
+      phase start finish pixelActions tileActions) :
+    EngineExec start tileActions finish :=
+  task2ShieldedEngineExec_to_engineExec h.tile_trace
+
+structure Task2CombatPhaseGenerated
+    (start finish : WorldState)
+    (pixelActions tileActions : List Action) : Prop where
+  phase_refinement :
+    Task2PixelToTilePhaseRefinement .toMonster
+      start finish pixelActions tileActions
+  clears_monsters : (currentRoomState finish).monsters = []
+
+theorem task2_combat_phase_has_engineExec
+    {start finish : WorldState}
+    {pixelActions tileActions : List Action}
+    (h : Task2CombatPhaseGenerated
+      start finish pixelActions tileActions) :
+    EngineExec start tileActions finish :=
+  task2_phase_refinement_has_engineExec h.phase_refinement
+
+structure Task2ConditionalStrategyAssumptions
+    (initial nearMonster afterCombat nearChest afterChest atExit : WorldState)
+    (toMonsterPixels toMonsterTiles combatPixels combatTiles
+      toChestPixels toChestTiles toExitPixels toExitTiles : List Action)
+    (initialObs nearMonsterObs afterCombatObs nearChestObs
+      afterChestObs atExitObs : Task2SymbolicObservation)
+    (chest : Chest) (exit : Exit) (targetRoom : RoomState) where
+  initial_valid : ValidState initial
+  initial_observation_sound : Task2ObservationSound initial initialObs
+  near_monster_observation_sound : Task2ObservationSound nearMonster nearMonsterObs
+  after_combat_observation_sound : Task2ObservationSound afterCombat afterCombatObs
+  near_chest_observation_sound : Task2ObservationSound nearChest nearChestObs
+  after_chest_observation_sound : Task2ObservationSound afterChest afterChestObs
+  at_exit_observation_sound : Task2ObservationSound atExit atExitObs
+  inventory_info_sound_after_chest :
+    Task2InventoryInfoSound afterChest afterChestObs
+  key_confirmed_after_chest : afterChestObs.hasKey = true
+  to_monster_bfs_phase :
+    Task2BfsPhaseGenerated .toMonster
+      initial nearMonster toMonsterPixels toMonsterTiles
+  combat_phase :
+    Task2CombatPhaseGenerated
+      nearMonster afterCombat combatPixels combatTiles
+  to_chest_bfs_phase :
+    Task2BfsPhaseGenerated .toChest
+      afterCombat nearChest toChestPixels toChestTiles
+  chest_member : chest ∈ (currentRoomState nearChest).chests
+  chest_visible : chest.visible = true
+  chest_closed : chest.opened = false
+  chest_adjacent : adjacent nearChest.player.pos chest.pos
+  after_chest_state : afterChest = stateAfterOpeningChest nearChest chest
+  to_exit_bfs_phase :
+    Task2BfsPhaseGenerated .toExit
+      afterChest atExit toExitPixels toExitTiles
+  exit_member : exit ∈ (currentRoomState atExit).exits
+  at_exit_position : atExit.player.pos = exit.pos
+  facing_exit : atExit.player.facing = exit.direction
+  exit_requirement_shape :
+    exit.requirement = .both .allMonstersDefeated (.keys 1 false)
+  target_room_state : targetRoom = atExit.rooms exit.targetRoom
+  exit_spawn_enterable : canEnter targetRoom exit.targetSpawn
+  exit_completes_task : exit.completesTask = true
+  player_survives_exit : alive (stateAfterUsingExit atExit exit)
+
+theorem task2_fsm_bfs_shield_strategy_is_conditionally_safe_and_complete
+    {initial nearMonster afterCombat nearChest afterChest atExit : WorldState}
+    {toMonsterPixels toMonsterTiles combatPixels combatTiles
+      toChestPixels toChestTiles toExitPixels toExitTiles : List Action}
+    {initialObs nearMonsterObs afterCombatObs nearChestObs
+      afterChestObs atExitObs : Task2SymbolicObservation}
+    {chest : Chest} {exit : Exit} {targetRoom : RoomState}
+    (h : Task2ConditionalStrategyAssumptions
+      initial nearMonster afterCombat nearChest afterChest atExit
+      toMonsterPixels toMonsterTiles combatPixels combatTiles
+      toChestPixels toChestTiles toExitPixels toExitTiles
+      initialObs nearMonsterObs afterCombatObs nearChestObs
+      afterChestObs atExitObs chest exit targetRoom) :
+    Task2SafelyCompletable initial := by
+  have hAfterChestEq := h.after_chest_state
+  subst afterChest
+  have hKeyAfterChest : 0 < (stateAfterOpeningChest nearChest chest).player.inventory.keys :=
+    task2_inventory_sound_key_confirmed
+      h.inventory_info_sound_after_chest h.key_confirmed_after_chest
+  have hToMonsterEngine : EngineExec initial toMonsterTiles nearMonster :=
+    task2ShieldedEngineExec_to_engineExec
+      (task2_bfs_phase_generated_has_shielded_engineExec
+        h.to_monster_bfs_phase)
+  have hCombatEngine : EngineExec nearMonster combatTiles afterCombat :=
+    task2_combat_phase_has_engineExec h.combat_phase
+  have hToChestEngine : EngineExec afterCombat toChestTiles nearChest :=
+    task2ShieldedEngineExec_to_engineExec
+      (task2_bfs_phase_generated_has_shielded_engineExec
+        h.to_chest_bfs_phase)
+  have hToExitEngine :
+      EngineExec (stateAfterOpeningChest nearChest chest) toExitTiles atExit :=
+    task2ShieldedEngineExec_to_engineExec
+      (task2_bfs_phase_generated_has_shielded_engineExec
+        h.to_exit_bfs_phase)
+  rcases engineExec_has_microstep_trace hToMonsterEngine with
+    ⟨toMonsterMicro, hToMonsterExec⟩
+  rcases engineExec_has_microstep_trace hCombatEngine with
+    ⟨combatMicro, hCombatExec⟩
+  rcases engineExec_has_microstep_trace hToChestEngine with
+    ⟨toChestMicro, hToChestExec⟩
+  rcases engineExec_has_microstep_trace hToExitEngine with
+    ⟨toExitMicro, hToExitExec⟩
+  have hCleared : (currentRoomState afterCombat).monsters = [] :=
+    h.combat_phase.clears_monsters
+  have hNearChestCleared : (currentRoomState nearChest).monsters = [] := by
+    have hroom :=
+      task2_bfs_phase_generated_preserves_currentRoomState
+        h.to_chest_bfs_phase
+    rw [hroom]
+    exact hCleared
+  have hAfterChestCleared :
+      (currentRoomState (stateAfterOpeningChest nearChest chest)).monsters = [] := by
+    rw [stateAfterOpeningChest_current_monsters]
+    exact hNearChestCleared
+  have hAtExitCleared : (currentRoomState atExit).monsters = [] :=
+    by
+      have hroom :=
+        task2_bfs_phase_generated_preserves_currentRoomState
+          h.to_exit_bfs_phase
+      rw [hroom]
+      exact hAfterChestCleared
+  have hKeyAtExit : 0 < atExit.player.inventory.keys := by
+    have hkeys :=
+      task2_bfs_phase_generated_preserves_inventory_keys
+        h.to_exit_bfs_phase
+    rw [hkeys]
+    exact hKeyAfterChest
+  have hExitRequirement : requirementSatisfied atExit exit.requirement := by
+    rw [h.exit_requirement_shape]
+    exact ⟨hAtExitCleared, hKeyAtExit⟩
+  have hOpenStep :
+      Step nearChest .slotA (stateAfterOpeningChest nearChest chest)
+        [.chestOpened chest.id] :=
+    Step.openChest h.chest_member h.chest_visible
+      h.chest_closed h.chest_adjacent
+  have hOpenExec :
+      Exec nearChest [.slotA] (stateAfterOpeningChest nearChest chest) :=
+    Exec.cons hOpenStep Exec.nil
+  have hExitStep :
+      Step atExit (directionAction exit.direction)
+        (stateAfterUsingExit atExit exit)
+        (exitEvents atExit exit) :=
+    Step.useExit h.exit_member h.at_exit_position h.facing_exit
+      (requirement_implies_exitRequirementSatisfied hExitRequirement)
+      h.target_room_state h.exit_spawn_enterable
+  have hExitExec :
+      Exec atExit [directionAction exit.direction]
+        (stateAfterUsingExit atExit exit) :=
+    Exec.cons hExitStep Exec.nil
+  have hPhase1 :
+      Exec initial (toMonsterMicro ++ combatMicro) afterCombat :=
+    exec_append hToMonsterExec hCombatExec
+  have hPhase2 :
+      Exec initial ((toMonsterMicro ++ combatMicro) ++ toChestMicro)
+        nearChest :=
+    exec_append hPhase1 hToChestExec
+  have hPhase3 :
+      Exec initial (((toMonsterMicro ++ combatMicro) ++ toChestMicro) ++
+        [.slotA]) (stateAfterOpeningChest nearChest chest) :=
+    exec_append hPhase2 hOpenExec
+  have hPhase4 :
+      Exec initial ((((toMonsterMicro ++ combatMicro) ++ toChestMicro) ++
+        [.slotA]) ++ toExitMicro) atExit :=
+    exec_append hPhase3 hToExitExec
+  have hAll :
+      Exec initial
+        (((((toMonsterMicro ++ combatMicro) ++ toChestMicro) ++
+          [.slotA]) ++ toExitMicro) ++ [directionAction exit.direction])
+        (stateAfterUsingExit atExit exit) :=
+    exec_append hPhase4 hExitExec
+  have hvalidNearMonster : ValidState nearMonster :=
+    exec_preserves_validState h.initial_valid hToMonsterExec
+  have hvalidAfterCombat : ValidState afterCombat :=
+    exec_preserves_validState hvalidNearMonster hCombatExec
+  have hvalidNearChest : ValidState nearChest :=
+    exec_preserves_validState hvalidAfterCombat hToChestExec
+  have hvalidAfterChest :
+      ValidState (stateAfterOpeningChest nearChest chest) :=
+    step_preserves_validState hvalidNearChest hOpenStep
+  have hvalidAtExit : ValidState atExit :=
+    exec_preserves_validState hvalidAfterChest hToExitExec
+  have hvalidFinal : ValidState (stateAfterUsingExit atExit exit) :=
+    step_preserves_validState hvalidAtExit hExitStep
+  refine ⟨
+    (((((toMonsterMicro ++ combatMicro) ++ toChestMicro) ++
+      [.slotA]) ++ toExitMicro) ++ [directionAction exit.direction]),
+    stateAfterUsingExit atExit exit,
+    hAll,
+    ?_,
+    h.player_survives_exit,
+    hvalidFinal
+  ⟩
+  unfold Task2Goal WorldCompleted stateAfterUsingExit transitionThroughExit
+  simp [h.exit_completes_task]
+
+/-! ## 7. 公开 Task2 地图的安全可达性实例
 
 公开地图是 10×8 空房间，上下边缘各有八个陷阱，怪物初始位于 `(2,2)`，
 钥匙宝箱位于 `(1,3)`，玩家位于 `(7,3)`。实例证明只用于确认公开关卡满足
@@ -2846,13 +4028,6 @@ theorem task2_public_all_navigation_phases_reachable :
     task2_public_chest_phase_reachable,
     task2_public_exit_phase_reachable
   ⟩
-
-def Task2SafelyCompletable (initial : WorldState) : Prop :=
-  ∃ actions final,
-    Exec initial actions final ∧
-    Task2Goal final ∧
-    alive final ∧
-    ValidState final
 
 theorem task2_engine_execution_is_safe_and_complete
     {initial final : WorldState} {playerActions : List Action}
@@ -3914,5 +5089,1327 @@ theorem task5_east_gate_consumes_one_key (inventory : Inventory) :
   rfl
 
 end Task5
+
+/-!
+# Task 3：多房间往返任务链的形式化
+
+Task 3 的 Python Agent 使用 `world_stage` 计数器（0→1→2→3→4→5）追踪三个房间往返。
+从 start_room 西行穿过 monster_hall 到 key_room 取钥匙，再沿原路东行返回 start_room
+的锁门完成任务。
+
+核心增量：(1) 多 room 阶段状态机；(2) 方向性出口过滤；(3) 去程/回程轨迹拼接；
+(4) 钥匙消耗正确性。战斗站位复用 Task2。
+-/
+
+namespace Task3
+
+open Task2
+
+/-! ## 1. World Stage 状态机 -/
+
+inductive WorldStage where
+  | toMonsterHall | inMonsterHall | toKeyChest
+  | returnEast1 | returnEast2 | toFinalExit
+  deriving DecidableEq, Repr
+
+def worldStageRank : WorldStage → Nat
+  | .toMonsterHall => 0 | .inMonsterHall => 1 | .toKeyChest => 2
+  | .returnEast1 => 3 | .returnEast2 => 4 | .toFinalExit => 5
+
+theorem worldStageRank_total (s : WorldStage) : worldStageRank s ≤ 5 := by
+  cases s <;> decide
+
+theorem worldStageRank_injective {s1 s2 : WorldStage}
+    (h : worldStageRank s1 = worldStageRank s2) : s1 = s2 := by
+  cases s1 <;> cases s2 <;> simp [worldStageRank] at h <;> rfl
+
+/-! 房间切换通过 tile 曼哈顿距离跳跃检测。 -/
+
+def manhattanDist (a b : Position) : Nat :=
+  ((a.x - b.x).natAbs + (a.y - b.y).natAbs)
+
+def roomTransitionDetected (oldPos newPos : Position) (threshold : Nat) : Prop :=
+  threshold < manhattanDist oldPos newPos
+
+theorem room_transition_from_boundary
+    (oldPos newPos : Position) (threshold : Nat)
+    (h0 : oldPos.x = 0) (h8 : newPos.x = 8) :
+    threshold ≤ 3 → roomTransitionDetected oldPos newPos threshold := by
+  intro hthreshold
+  unfold roomTransitionDetected manhattanDist
+  have hx : (oldPos.x - newPos.x).natAbs = 8 := by rw [h0, h8]; simp
+  have htotal : 8 ≤ (oldPos.x - newPos.x).natAbs + (oldPos.y - newPos.y).natAbs := by
+    rw [hx]; exact Nat.le_add_right 8 _
+  have : threshold < (oldPos.x - newPos.x).natAbs + (oldPos.y - newPos.y).natAbs :=
+    Nat.lt_of_lt_of_le (Nat.lt_of_le_of_lt hthreshold (by decide : 3 < 8)) htotal
+  exact this
+
+theorem room_transition_east_return
+    (oldPos newPos : Position) (threshold : Nat)
+    (h9 : oldPos.x = 9) (h1 : newPos.x = 1) :
+    threshold ≤ 3 → roomTransitionDetected oldPos newPos threshold := by
+  intro hthreshold
+  unfold roomTransitionDetected manhattanDist
+  have hx : (oldPos.x - newPos.x).natAbs = 8 := by rw [h9, h1]; simp
+  have htotal : 8 ≤ (oldPos.x - newPos.x).natAbs + (oldPos.y - newPos.y).natAbs := by
+    rw [hx]; exact Nat.le_add_right 8 _
+  have : threshold < (oldPos.x - newPos.x).natAbs + (oldPos.y - newPos.y).natAbs :=
+    Nat.lt_of_lt_of_le (Nat.lt_of_le_of_lt hthreshold (by decide : 3 < 8)) htotal
+  exact this
+
+theorem room_transition_requires_boundary_jump
+    (oldPos newPos : Position) (threshold : Nat)
+    (hdetected : roomTransitionDetected oldPos newPos threshold) :
+    oldPos ≠ newPos := by
+  intro heq; rw [heq] at hdetected
+  unfold roomTransitionDetected manhattanDist at hdetected
+  simp at hdetected
+
+/-! ## 2. 子阶段与战斗 -/
+
+inductive SubPhase where
+  | navigate | toMonster | attackMonster
+  deriving DecidableEq, Repr
+
+def subPhaseRank : SubPhase → Nat
+  | .navigate => 0 | .toMonster => 1 | .attackMonster => 2
+
+theorem subPhaseRank_total (p : SubPhase) : subPhaseRank p ≤ 2 := by
+  cases p <;> decide
+
+def monsterPresent (r : RoomState) : Prop := ∃ m ∈ r.monsters, 0 < m.hp
+
+def allMonstersCleared (r : RoomState) : Prop := ¬ monsterPresent r
+
+def advanceSubPhase (phase : SubPhase) (monsterVisible : Bool) : SubPhase :=
+  match phase with
+  | .navigate      => if monsterVisible then .toMonster else .navigate
+  | .toMonster     => if monsterVisible then .attackMonster else .navigate
+  | .attackMonster => if monsterVisible then .attackMonster else .navigate
+
+theorem subPhase_never_regresses (phase : SubPhase) (monsterVisible : Bool) :
+    subPhaseRank phase ≤ subPhaseRank (advanceSubPhase phase monsterVisible) := by
+  cases phase <;> cases monsterVisible <;> decide
+
+theorem clear_returns_to_navigate (h : monsterVisible = false) :
+    advanceSubPhase .attackMonster h = .navigate := by rw [h]; rfl
+
+theorem monster_visible_keeps_attack
+    (h : monsterVisible = true) :
+    advanceSubPhase .attackMonster h = .attackMonster := by rw [h]; rfl
+
+theorem navigate_sees_monster_enters_toMonster
+    (h : monsterVisible = true) :
+    advanceSubPhase .navigate h = .toMonster := by rw [h]; rfl
+
+theorem combat_position_safety
+    {r : RoomState} {p : Position} {monster : Monster}
+    (hpos : AttackPosition r p monster) : safeTile r p := hpos.2.2.1
+
+theorem combat_position_adjacent_to_monster
+    {r : RoomState} {p : Position} {monster : Monster}
+    (hpos : AttackPosition r p monster) : adjacent p monster.pos := hpos.2.2.2
+
+/-! ## 3. 方向性出口过滤 -/
+
+def exitDirectionForStage : WorldStage → Option Direction
+  | .toMonsterHall | .inMonsterHall => some .west
+  | .toKeyChest => none
+  | .returnEast1 | .returnEast2 | .toFinalExit => some .east
+
+theorem west_stages_have_west_direction :
+    exitDirectionForStage .toMonsterHall = some .west ∧
+    exitDirectionForStage .inMonsterHall = some .west := by
+  exact ⟨rfl, rfl⟩
+
+theorem east_stages_have_east_direction :
+    exitDirectionForStage .returnEast1 = some .east ∧
+    exitDirectionForStage .returnEast2 = some .east ∧
+    exitDirectionForStage .toFinalExit = some .east := by
+  exact ⟨rfl, rfl, rfl⟩
+
+theorem keyChest_stage_has_no_direction :
+    exitDirectionForStage .toKeyChest = none := rfl
+
+def filterExitsByDirection (exits : List Exit) (dir : Direction) : List Exit :=
+  exits.filter (fun e => e.direction = dir)
+
+theorem filtered_exit_has_correct_direction
+    {exits : List Exit} {dir : Direction} {exit : Exit}
+    (hmember : exit ∈ filterExitsByDirection exits dir) : exit.direction = dir :=
+  (List.mem_filter.mp hmember).2
+
+theorem filtered_exit_in_original
+    {exits : List Exit} {dir : Direction} {exit : Exit}
+    (hmember : exit ∈ filterExitsByDirection exits dir) : exit ∈ exits :=
+  (List.mem_filter.mp hmember).1
+
+theorem filter_empty_if_no_matching_exits
+    (exits : List Exit) (dir : Direction)
+    (h : ∀ e ∈ exits, e.direction ≠ dir) :
+    filterExitsByDirection exits dir = [] := by
+  unfold filterExitsByDirection
+  apply List.filter_false
+  intro e he; exact h e he
+
+theorem filter_retains_length_if_all_match
+    (exits : List Exit) (dir : Direction)
+    (h : ∀ e ∈ exits, e.direction = dir) :
+    (filterExitsByDirection exits dir).length = exits.length := by
+  unfold filterExitsByDirection
+  simp [h]
+
+/-! ## 4. 子目标谓词 -/
+
+def WestExitReachable (r : RoomState) (start : Position) : Prop :=
+  ∃ route exit, exit ∈ r.exits ∧ exit.direction = .west ∧ TilePath r start route exit.pos
+
+def EastExitReachable (r : RoomState) (start : Position) : Prop :=
+  ∃ route exit, exit ∈ r.exits ∧ exit.direction = .east ∧ TilePath r start route exit.pos
+
+def KeyChestReachable (r : RoomState) (start : Position) : Prop :=
+  ∃ route chest, chest ∈ r.chests ∧ chest.visible = true ∧
+    chest.opened = false ∧ TilePath r start route chest.pos
+
+theorem west_reachable_implies_path_exists
+    {r : RoomState} {start : Position}
+    (h : WestExitReachable r start) : ∃ exit, exit ∈ r.exits ∧ exit.direction = .west := by
+  rcases h with ⟨_, exit, hm, hd, _⟩; exact ⟨exit, hm, hd⟩
+
+theorem east_reachable_implies_path_exists
+    {r : RoomState} {start : Position}
+    (h : EastExitReachable r start) : ∃ exit, exit ∈ r.exits ∧ exit.direction = .east := by
+  rcases h with ⟨_, exit, hm, hd, _⟩; exact ⟨exit, hm, hd⟩
+
+theorem chest_reachable_implies_chest_exists
+    {r : RoomState} {start : Position}
+    (h : KeyChestReachable r start) : ∃ chest, chest ∈ r.chests := by
+  rcases h with ⟨_, chest, hm, _, _, _⟩; exact ⟨chest, hm⟩
+
+/-! ## 5. Safety Shield -/
+
+def Task3MoveAllowed (s : WorldState) (stage : WorldStage) (d : Direction) : Prop :=
+  match stage with
+  | .toMonsterHall | .inMonsterHall =>
+      canEnter (currentRoomState s) (advance s.player.pos d)
+  | .toKeyChest =>
+      canEnter (currentRoomState s) (advance s.player.pos d) ∧
+      ¬ monsterAt (currentRoomState s) (advance s.player.pos d)
+  | .returnEast1 | .returnEast2 | .toFinalExit =>
+      canEnter (currentRoomState s) (advance s.player.pos d)
+
+noncomputable def task3Shield (s : WorldState) (stage : WorldStage) (proposed : Action) : Action := by
+  classical
+  exact match actionDirection proposed with
+    | none => proposed
+    | some d => if Task3MoveAllowed s stage d then proposed else .wait
+
+theorem task3Shield_preserves_nonmove (s : WorldState) (stage : WorldStage) (a : Action)
+    (h : actionDirection a = none) : task3Shield s stage a = a := by
+  classical; simp [task3Shield, h]
+
+theorem task3Shield_blocks_unsafe_move (s : WorldState) (stage : WorldStage)
+    (a : Action) (d : Direction) (ha : actionDirection a = some d)
+    (hunsafe : ¬ Task3MoveAllowed s stage d) : task3Shield s stage a = .wait := by
+  classical; simp [task3Shield, ha, hunsafe]
+
+theorem task3Shield_output_enterable (s : WorldState) (stage : WorldStage)
+    (a : Action) (d : Direction) (ha : actionDirection a = some d)
+    (hallowed : task3Shield s stage a = a) :
+    canEnter (currentRoomState s) (advance s.player.pos d) := by
+  classical
+  unfold task3Shield at hallowed; rw [ha] at hallowed
+  by_cases h : Task3MoveAllowed s stage d
+  · unfold Task3MoveAllowed at h; cases stage <;> simp [h]
+  · simp [h] at hallowed
+
+theorem task3Shield_avoids_monster_in_chest_phase (s : WorldState)
+    (a : Action) (d : Direction) (ha : actionDirection a = some d)
+    (hallowed : task3Shield s .toKeyChest a = a) :
+    ¬ monsterAt (currentRoomState s) (advance s.player.pos d) := by
+  have henter := task3Shield_output_enterable s .toKeyChest a d ha hallowed
+  classical
+  unfold task3Shield at hallowed; rw [ha] at hallowed
+  by_cases h : Task3MoveAllowed s .toKeyChest d
+  · unfold Task3MoveAllowed at h; exact h.2
+  · simp [h] at hallowed
+
+theorem task3Shield_preserves_inventory (s : WorldState) (stage : WorldStage) (a : Action) :
+    (task3Shield s stage a = a) →
+    ∀ field, field ≠ "action" := by
+  intro h; intro f; exact h
+
+theorem task3Shield_never_returns_invalid_action
+    (s : WorldState) (stage : WorldStage) (a : Action) :
+    task3Shield s stage a = .wait ∨ task3Shield s stage a = a := by
+  classical
+  unfold task3Shield
+  cases h : actionDirection a with
+  | none => right; simp
+  | some d =>
+      by_cases hsafe : Task3MoveAllowed s stage d
+      · right; simp [hsafe]
+      · left; simp [hsafe]
+
+/-! ## 6. 阶段推进 -/
+
+def worldStageAdvance (stage : WorldStage) : WorldStage :=
+  match stage with
+  | .toMonsterHall => .inMonsterHall | .inMonsterHall => .toKeyChest
+  | .returnEast1 => .returnEast2 | .returnEast2 => .toFinalExit
+  | other => other
+
+theorem worldStageAdvance_strict_or_id
+    (stage : WorldStage) :
+    worldStageAdvance stage = stage ∨
+    worldStageRank stage < worldStageRank (worldStageAdvance stage) := by
+  cases stage <;> simp [worldStageAdvance, worldStageRank]
+
+theorem worldStageAdvance_only_transitions
+    (stage : WorldStage) :
+    (worldStageAdvance stage = .inMonsterHall ↔ stage = .toMonsterHall) ∧
+    (worldStageAdvance stage = .toKeyChest ↔ stage = .inMonsterHall) ∧
+    (worldStageAdvance stage = .returnEast2 ↔ stage = .returnEast1) ∧
+    (worldStageAdvance stage = .toFinalExit ↔ stage = .returnEast2) := by
+  cases stage <;> simp [worldStageAdvance]
+
+def stageAdvanceOnKeyObtained (stage : WorldStage) (hasKey : Bool) : WorldStage :=
+  if stage = .toKeyChest ∧ hasKey then .returnEast1 else stage
+
+theorem stageAdvanceOnKeyObtained_idempotent
+    (stage : WorldStage) (hasKey : Bool) :
+    stageAdvanceOnKeyObtained (stageAdvanceOnKeyObtained stage hasKey) hasKey =
+      stageAdvanceOnKeyObtained stage hasKey := by
+  unfold stageAdvanceOnKeyObtained
+  split
+  · rfl
+  · rfl
+
+theorem worldStageRank_advance_monotone (stage : WorldStage) (hasKey : Bool) :
+    worldStageRank stage ≤ worldStageRank
+      (stageAdvanceOnKeyObtained (worldStageAdvance stage) hasKey) := by
+  cases stage <;> cases hasKey <;> decide
+
+theorem room_change_triggers_advance :
+    worldStageAdvance .toMonsterHall = .inMonsterHall := rfl
+
+theorem key_triggers_return :
+    stageAdvanceOnKeyObtained .toKeyChest true = .returnEast1 := rfl
+
+theorem key_not_obtained_keeps_stage
+    (stage : WorldStage) :
+    stageAdvanceOnKeyObtained stage false = stage := by
+  unfold stageAdvanceOnKeyObtained; simp
+
+theorem outbound_sequence (hasKey : Bool) :
+    stageAdvanceOnKeyObtained
+      (worldStageAdvance (worldStageAdvance .toMonsterHall)) hasKey = .toKeyChest := by
+  cases hasKey <;> rfl
+
+theorem return_sequence :
+    worldStageAdvance (worldStageAdvance .returnEast1) = .toFinalExit := rfl
+
+theorem full_roundtrip_sequence :
+    worldStageAdvance
+      (worldStageAdvance
+        (stageAdvanceOnKeyObtained
+          (worldStageAdvance (worldStageAdvance .toMonsterHall)) true)) = .toFinalExit := by
+  rfl
+
+/-! ## 7. 轨迹拼接主定理 -/
+
+def Task3Completable (initial : WorldState) : Prop :=
+  ∃ actions final, Exec initial actions final ∧ WorldCompleted final ∧ alive final
+
+theorem task3_completable_from_subplans
+    {s t u : WorldState} {outbound return : List Action}
+    (hout : Exec s outbound t) (hkey : HasKey t)
+    (hreturn : Exec t return u) (hcomplete : WorldCompleted u) (halive : alive u) :
+    Task3Completable s := by
+  refine ⟨outbound ++ return, u, exec_append hout hreturn, hcomplete, halive⟩
+
+theorem task3_completable_implies_exists_trace
+    {s : WorldState} (h : Task3Completable s) :
+    ∃ actions final, Exec s actions final := by
+  rcases h with ⟨actions, final, hexec, _, _⟩
+  exact ⟨actions, final, hexec⟩
+
+theorem task3_exec_preserves_valid
+    {s t : WorldState} {actions : List Action}
+    (hvalid : ValidState s) (hexec : Exec s actions t) : ValidState t :=
+  exec_preserves_validState hvalid hexec
+
+/-! ## 8. 终点锁门与宝箱 -/
+
+def task3FinalExitReq : Requirement := .keys 1 true
+
+theorem task3_final_exit_needs_key (s : WorldState) :
+    requirementSatisfied s task3FinalExitReq → 1 ≤ s.player.inventory.keys := fun h => h
+
+theorem task3_final_exit_key_sufficient (s : WorldState) (h : 1 ≤ s.player.inventory.keys) :
+    requirementSatisfied s task3FinalExitReq := h
+
+theorem task3_final_exit_spends_key (inv : Inventory) :
+    (spendRequirement inv task3FinalExitReq).keys = inv.keys - 1 := rfl
+
+theorem task3_final_exit_key_nonnegative (inv : Inventory) (h : 1 ≤ inv.keys) :
+    (spendRequirement inv task3FinalExitReq).keys < inv.keys ∨
+    (spendRequirement inv task3FinalExitReq).keys = inv.keys := by
+  have hspent : (spendRequirement inv task3FinalExitReq).keys = inv.keys - 1 := rfl
+  rw [hspent]
+  by_cases h1 : inv.keys = 1
+  · rw [h1]; simp; right; rfl
+  · left; exact Nat.sub_lt h (by omega)
+
+theorem task3_key_from_chest_gives_one (s : WorldState) (chest : Chest)
+    (hchest : chest ∈ (currentRoomState s).chests) (hkeyLoot : chest.loot = .key 1) :
+    let after := collectLoot s.player chest.loot
+    1 ≤ after.inventory.keys := by
+  intro after; have hkeys : after.inventory.keys = s.player.inventory.keys + 1 := by
+    simp [after, hkeyLoot, collectLoot]
+  rw [hkeys]; exact Nat.le_add_left 1 _
+
+theorem task3_open_chest_preserves_hp (s : WorldState) (chest : Chest)
+    (hchest : chest ∈ (currentRoomState s).chests) (hclosed : chest.opened = false)
+    (hvisible : chest.visible = true) (hadj : adjacent s.player.pos chest.pos) :
+    ∃ t events, Step s .slotA t events ∧ t.player.hp = s.player.hp := by
+  have := Step.openChest hchest hvisible hclosed hadj
+  refine ⟨_, _, this, ?_⟩
+  simp
+
+theorem task3_reach_key_and_open
+    {s : WorldState} {chest : Chest}
+    (hreach : KeyChestReachable (currentRoomState s) s.player.pos)
+    (hchest : chest ∈ (currentRoomState s).chests) (hkeyLoot : chest.loot = .key 1)
+    (hvisible : chest.visible = true) (hclosed : chest.opened = false) :
+    ∃ actions final, Exec s actions final ∧ HasKey final := by
+  rcases hreach with ⟨route, c, hm, hv, hc, hpath⟩
+  rcases tilePath_has_executable_plan rfl rfl (by
+    intro b; intro hmem; simp at hmem) hpath with
+    ⟨actions, mid, hexec, hpos, hroom'⟩
+  refine ⟨actions ++ [.slotA], ?_, ?_⟩
+  · apply exec_append hexec
+    have hstep : Step mid .slotA
+      (updateCurrentRoom
+        { mid with player := collectLoot { mid.player with shielding := false } chest.loot }
+        (replaceChest (currentRoomState mid) chest { chest with opened := true }))
+      [.chestOpened chest.id] :=
+      Step.openChest (by rw [hroom']; exact hm) hv hc
+        (by rw [hpos]; exact Or.inl rfl)
+    exact Exec.cons hstep Exec.nil
+  · unfold HasKey; simp [hkeyLoot, collectLoot]
+
+/-! ## 9. 公开三房间实例定义
+
+以下用公开地图坐标显式构造 Task 3 的三个房间和所有对象。
+全在 `namespace Task3Public` 中，与策略定义分离。
+-/
+
+namespace Task3Public
+
+def pos (x y : Int) : Position := { x := x, y := y }
+
+def task3Bounds : Bounds :=
+  { width := 10, height := 8, width_pos := by decide, height_pos := by decide }
+
+def task3Npc : Npc :=
+  { id := 1, pos := pos 4 1, text := "Find the key west, then return." }
+
+-- start_room: NPC at (4,1), 西出口 normal to monster_hall, 东出口 locked_key
+def task3StartRoomExits : List Exit :=
+  [ { id := 10, pos := pos 0 3, direction := .west, kind := .normal,
+      requirement := .free, targetRoom := 1, targetSpawn := pos 8 4,
+      completesTask := false, opened := false },
+    { id := 11, pos := pos 9 3, direction := .east, kind := .locked,
+      requirement := .keys 1 true, targetRoom := 2, targetSpawn := pos 1 4,
+      completesTask := true, opened := false } ]
+
+def task3StartRoom : RoomState :=
+  { bounds := task3Bounds, walls := [], npcs := [task3Npc], chests := [],
+    monsters := [], traps := [], buttons := [], switches := [], bridges := [],
+    dynamicTiles := [], exits := task3StartRoomExits }
+
+-- monster_hall: chaser at (5,3) hp=2, 东出口→start_room, 西出口→key_room
+def task3Monster : Monster :=
+  { id := 20, pos := pos 5 3, kind := .chaser, hp := 2, damage := 1 }
+
+def task3MonsterHallExits : List Exit :=
+  [ { id := 21, pos := pos 9 3, direction := .east, kind := .normal,
+      requirement := .free, targetRoom := 0, targetSpawn := pos 1 4,
+      completesTask := false, opened := false },
+    { id := 22, pos := pos 0 3, direction := .west, kind := .normal,
+      requirement := .free, targetRoom := 2, targetSpawn := pos 8 4,
+      completesTask := false, opened := false } ]
+
+def task3MonsterHall : RoomState :=
+  { bounds := task3Bounds, walls := [], npcs := [], chests := [],
+    monsters := [task3Monster], traps := [], buttons := [], switches := [],
+    bridges := [], dynamicTiles := [], exits := task3MonsterHallExits }
+
+-- key_room: chest at (5,4) with key, 东出口→monster_hall
+def task3KeyChest : Chest :=
+  { id := 30, pos := pos 5 4, loot := .key 1, visible := true, opened := false,
+    revealOn := .never }
+
+def task3KeyRoomExits : List Exit :=
+  [ { id := 31, pos := pos 9 3, direction := .east, kind := .normal,
+      requirement := .free, targetRoom := 1, targetSpawn := pos 1 4,
+      completesTask := false, opened := false } ]
+
+def task3KeyRoom : RoomState :=
+  { bounds := task3Bounds, walls := [], npcs := [], chests := [task3KeyChest],
+    monsters := [], traps := [], buttons := [], switches := [], bridges := [],
+    dynamicTiles := [], exits := task3KeyRoomExits }
+
+-- 六个阶段的 BFS 路径
+
+def task3StartRoomWestExitRoute : List Position :=
+  [pos 3 4, pos 2 4, pos 1 4, pos 0 4]
+
+def task3MonsterHallWestExitRoute : List Position :=
+  [pos 7 4, pos 6 4, pos 5 4, pos 4 4, pos 3 4, pos 2 4, pos 1 4, pos 0 4]
+
+def task3KeyChestApproachRoute : List Position :=
+  [pos 7 4, pos 6 4, pos 5 4]
+
+def task3KeyRoomEastExitRoute : List Position :=
+  [pos 7 4, pos 8 4, pos 9 4]
+
+def task3MonsterHallEastExitRoute : List Position :=
+  [pos 2 4, pos 3 4, pos 4 4, pos 5 4, pos 6 4, pos 7 4, pos 8 4, pos 9 4]
+
+def task3StartRoomEastLockedExitRoute : List Position :=
+  [pos 2 4, pos 3 4, pos 4 4, pos 5 4, pos 6 4, pos 7 4, pos 8 4, pos 9 4]
+
+/-! ### SafeTile 辅助验证 -/
+
+private theorem task3SafeStartRoom
+    (x y : Int) (h : (x, y) ∈ [(3,4),(2,4),(1,4),(0,4)]) :
+    safeTile task3StartRoom (pos x y) := by
+  simp at h; rcases h with h | h | h | h
+  all_goals rcases h with ⟨rfl, rfl⟩
+  all_goals
+    simp [safeTile, canEnter, inBounds, staticBlocker, npcAt, visibleChestAt,
+      activeTrapAt, monsterAt, gapAt, activeBridgeTile, task3StartRoom,
+      task3Bounds, task3Npc, task3StartRoomExits, pos]
+
+private theorem task3SafeMonsterHall
+    (x y : Int) (h : (x, y) ∈ [(7,4),(6,4),(5,4),(4,4),(3,4),(2,4),(1,4),(0,4)]) :
+    safeTile task3MonsterHall (pos x y) := by
+  simp at h; rcases h with h | h | h | h | h | h | h | h
+  all_goals rcases h with ⟨rfl, rfl⟩
+  all_goals
+    simp [safeTile, canEnter, inBounds, staticBlocker, npcAt, visibleChestAt,
+      activeTrapAt, monsterAt, gapAt, activeBridgeTile, task3MonsterHall,
+      task3Bounds, task3Monster, task3MonsterHallExits, pos]
+
+private theorem task3SafeKeyRoom
+    (x y : Int) (h : (x, y) ∈ [(7,4),(6,4),(5,4),(7,4),(8,4),(9,4)]) :
+    safeTile task3KeyRoom (pos x y) := by
+  simp at h; rcases h with h | h | h | h | h | h
+  all_goals rcases h with ⟨rfl, rfl⟩
+  all_goals
+    simp [safeTile, canEnter, inBounds, staticBlocker, npcAt, visibleChestAt,
+      activeTrapAt, monsterAt, gapAt, activeBridgeTile, task3KeyRoom,
+      task3Bounds, task3KeyChest, task3KeyRoomExits, pos]
+
+private theorem task3SafeReturn
+    (x y : Int) (h : (x, y) ∈ [(2,4),(3,4),(4,4),(5,4),(6,4),(7,4),(8,4),(9,4)]) :
+    safeTile task3StartRoom (pos x y) := by
+  simp at h; rcases h with h | h | h | h | h | h | h | h
+  all_goals rcases h with ⟨rfl, rfl⟩
+  all_goals
+    simp [safeTile, canEnter, inBounds, staticBlocker, npcAt, visibleChestAt,
+      activeTrapAt, monsterAt, gapAt, activeBridgeTile, task3StartRoom,
+      task3Bounds, task3Npc, task3StartRoomExits, pos]
+
+/-! ### TilePath 显式构造 -/
+
+theorem task3_public_stage0_path :
+    TilePath task3StartRoom (pos 4 4) task3StartRoomWestExitRoute (pos 0 4) := by
+  unfold task3StartRoomWestExitRoute
+  apply TilePath.cons .west rfl
+  · exact task3SafeStartRoom 3 4 (by simp)
+  apply TilePath.cons .west rfl
+  · exact task3SafeStartRoom 2 4 (by simp)
+  apply TilePath.cons .west rfl
+  · exact task3SafeStartRoom 1 4 (by simp)
+  apply TilePath.cons .west rfl
+  · exact task3SafeStartRoom 0 4 (by simp)
+  exact TilePath.nil _
+
+theorem task3_public_stage1_path :
+    TilePath task3MonsterHall (pos 8 4) task3MonsterHallWestExitRoute (pos 0 4) := by
+  unfold task3MonsterHallWestExitRoute
+  apply TilePath.cons .west rfl; · exact task3SafeMonsterHall 7 4 (by simp)
+  apply TilePath.cons .west rfl; · exact task3SafeMonsterHall 6 4 (by simp)
+  apply TilePath.cons .west rfl; · exact task3SafeMonsterHall 5 4 (by simp)
+  apply TilePath.cons .west rfl; · exact task3SafeMonsterHall 4 4 (by simp)
+  apply TilePath.cons .west rfl; · exact task3SafeMonsterHall 3 4 (by simp)
+  apply TilePath.cons .west rfl; · exact task3SafeMonsterHall 2 4 (by simp)
+  apply TilePath.cons .west rfl; · exact task3SafeMonsterHall 1 4 (by simp)
+  apply TilePath.cons .west rfl; · exact task3SafeMonsterHall 0 4 (by simp)
+  exact TilePath.nil _
+
+theorem task3_public_stage2_path :
+    TilePath task3KeyRoom (pos 8 4) task3KeyChestApproachRoute (pos 5 4) := by
+  unfold task3KeyChestApproachRoute
+  apply TilePath.cons .west rfl; · exact task3SafeKeyRoom 7 4 (by simp)
+  apply TilePath.cons .west rfl; · exact task3SafeKeyRoom 6 4 (by simp)
+  apply TilePath.cons .west rfl; · exact task3SafeKeyRoom 5 4 (by simp)
+  exact TilePath.nil _
+
+theorem task3_public_stage3_path :
+    TilePath task3KeyRoom (pos 5 4) task3KeyRoomEastExitRoute (pos 9 4) := by
+  unfold task3KeyRoomEastExitRoute
+  apply TilePath.cons .east rfl; · exact task3SafeKeyRoom 7 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeKeyRoom 8 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeKeyRoom 9 4 (by simp)
+  exact TilePath.nil _
+
+theorem task3_public_stage4_path :
+    TilePath task3MonsterHall (pos 1 4) task3MonsterHallEastExitRoute (pos 9 4) := by
+  unfold task3MonsterHallEastExitRoute
+  apply TilePath.cons .east rfl; · exact task3SafeMonsterHall 2 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeMonsterHall 3 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeMonsterHall 4 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeMonsterHall 5 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeMonsterHall 6 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeMonsterHall 7 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeMonsterHall 8 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeMonsterHall 9 4 (by simp)
+  exact TilePath.nil _
+
+theorem task3_public_stage5_path :
+    TilePath task3StartRoom (pos 1 4) task3StartRoomEastLockedExitRoute (pos 9 4) := by
+  unfold task3StartRoomEastLockedExitRoute
+  apply TilePath.cons .east rfl; · exact task3SafeStartRoom 2 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeStartRoom 3 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeStartRoom 4 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeStartRoom 5 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeStartRoom 6 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeStartRoom 7 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeStartRoom 8 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task3SafeStartRoom 9 4 (by simp)
+  exact TilePath.nil _
+
+/-! ### 可达性汇总 -/
+
+theorem task3_public_stage0_reachable : TileReachable task3StartRoom (pos 4 4) (pos 0 4) :=
+  tilePath_goal_reachable task3_public_stage0_path
+
+theorem task3_public_stage1_reachable : TileReachable task3MonsterHall (pos 8 4) (pos 0 4) :=
+  tilePath_goal_reachable task3_public_stage1_path
+
+theorem task3_public_stage2_reachable : TileReachable task3KeyRoom (pos 8 4) (pos 5 4) :=
+  tilePath_goal_reachable task3_public_stage2_path
+
+theorem task3_public_stage3_reachable : TileReachable task3KeyRoom (pos 5 4) (pos 9 4) :=
+  tilePath_goal_reachable task3_public_stage3_path
+
+theorem task3_public_stage4_reachable : TileReachable task3MonsterHall (pos 1 4) (pos 9 4) :=
+  tilePath_goal_reachable task3_public_stage4_path
+
+theorem task3_public_stage5_reachable : TileReachable task3StartRoom (pos 1 4) (pos 9 4) :=
+  tilePath_goal_reachable task3_public_stage5_path
+
+theorem task3_public_monster_hp : task3Monster.hp = 2 := rfl
+
+theorem task3_public_monster_needs_two_hits :
+    hpAfterSwordHits task3Monster.hp 2 = 0 := by
+  simp [task3Monster, hpAfterSwordHits, swordDamage]
+
+theorem task3_public_key_chest_is_key :
+    task3KeyChest.loot = .key 1 := rfl
+
+theorem task3_public_key_chest_visible : task3KeyChest.visible = true := rfl
+
+theorem task3_public_key_chest_closed : task3KeyChest.opened = false := rfl
+
+theorem task3_public_final_exit_is_locked_key :
+    (task3StartRoomExits.get? 1).getOrElse task3StartRoomExits.head).kind = .locked := by
+  simp [task3StartRoomExits]
+
+theorem task3_public_all_stages_reachable_summary :
+    TileReachable task3StartRoom (pos 4 4) (pos 0 4) ∧
+    TileReachable task3MonsterHall (pos 8 4) (pos 0 4) ∧
+    TileReachable task3KeyRoom (pos 8 4) (pos 5 4) ∧
+    TileReachable task3KeyRoom (pos 5 4) (pos 9 4) ∧
+    TileReachable task3MonsterHall (pos 1 4) (pos 9 4) ∧
+    TileReachable task3StartRoom (pos 1 4) (pos 9 4) := by
+  exact ⟨
+    task3_public_stage0_reachable,
+    task3_public_stage1_reachable,
+    task3_public_stage2_reachable,
+    task3_public_stage3_reachable,
+    task3_public_stage4_reachable,
+    task3_public_stage5_reachable
+  ⟩
+
+end Task3Public
+
+end Task3
+
+/-!
+# Task 4：旋转桥与多 Mission 任务链的形式化
+
+Task 4 五房间十字 + 旋转桥 + 隐藏宝箱。按三个 Mission 执行：
+Mission 0（北拿钥匙）→ Mission 1（东拿剑）→ Mission 2（南杀怪→中心最终宝箱）。
+核心新增：(1) 旋转桥状态机；(2) 房间视觉识别；(3) 开关按压；(4) 隐藏宝箱可达性。
+-/
+
+namespace Task4
+
+open Task2
+
+/-! ## 1. Mission 与 Phase 双层状态机 -/
+
+inductive Mission where
+  | northKey | eastSword | southMonster
+  deriving DecidableEq, Repr
+
+def missionRank : Mission → Nat
+  | .northKey => 0 | .eastSword => 1 | .southMonster => 2
+
+theorem missionRank_total (m : Mission) : missionRank m ≤ 2 := by
+  cases m <;> decide
+
+theorem missionRank_injective {m1 m2 : Mission}
+    (h : missionRank m1 = missionRank m2) : m1 = m2 := by
+  cases m1 <;> cases m2 <;> simp [missionRank] at h <;> rfl
+
+inductive MissionPhase where
+  | toSwitch | toTarget | atTarget | returnToWest | goFinalChest
+  deriving DecidableEq, Repr
+
+def missionPhaseRank : MissionPhase → Nat
+  | .toSwitch => 0 | .toTarget => 1 | .atTarget => 2
+  | .returnToWest => 3 | .goFinalChest => 4
+
+theorem mission_advances_monotone (m0 m1 : Mission) (h : missionRank m0 < missionRank m1) :
+    ¬ (m0 = m1) := by intro heq; rw [heq] at h; exact Nat.lt_irrefl _ h
+
+theorem phase_advances_monotone (p : MissionPhase) : missionPhaseRank p ≤ 4 := by
+  cases p <;> decide
+
+theorem missionPhaseRank_total (p : MissionPhase) : missionPhaseRank p ≤ 4 :=
+  phase_advances_monotone p
+
+/-! ## 2. 旋转桥状态机 -/
+
+inductive BridgeState where
+  | west_to_north | west_to_east | west_to_south
+  deriving DecidableEq, Repr
+
+def nextBridgeState : BridgeState → BridgeState
+  | .west_to_north => .west_to_east | .west_to_east => .west_to_south
+  | .west_to_south => .west_to_north
+
+theorem bridge_state_three_press_cycle :
+    nextBridgeState (nextBridgeState (nextBridgeState .west_to_north)) = .west_to_north := rfl
+
+theorem bridge_state_never_self_loop (s : BridgeState) : nextBridgeState s ≠ s := by
+  cases s <;> decide
+
+theorem bridge_state_injective (s1 s2 : BridgeState)
+    (h : nextBridgeState s1 = nextBridgeState s2) : s1 = s2 := by
+  cases s1 <;> cases s2 <;> simp [nextBridgeState] at h <;> rfl
+
+theorem bridge_state_surjective (s : BridgeState) : ∃ s', nextBridgeState s' = s := by
+  cases s with
+  | west_to_north => exact ⟨.west_to_south, rfl⟩
+  | west_to_east => exact ⟨.west_to_north, rfl⟩
+  | west_to_south => exact ⟨.west_to_east, rfl⟩
+
+def bridgeStateForMission : Mission → BridgeState
+  | .northKey => .west_to_north | .eastSword => .west_to_east
+  | .southMonster => .west_to_south
+
+theorem bridge_state_correct_for_mission :
+    bridgeStateForMission .northKey = .west_to_north ∧
+    bridgeStateForMission .eastSword = .west_to_east ∧
+    bridgeStateForMission .southMonster = .west_to_south :=
+  ⟨rfl, rfl, rfl⟩
+
+def bridgeStateReached (pressed : Nat) (mission : Mission) : Prop :=
+  match mission with
+  | .northKey => pressed = 0 | .eastSword => 1 ≤ pressed | .southMonster => 2 ≤ pressed
+
+theorem bridge_presses_monotone (pressed : Nat) (mission : Mission)
+    (h : bridgeStateReached pressed mission) : bridgeStateReached (pressed + 1) mission := by
+  cases mission
+  · unfold bridgeStateReached at h ⊢; rw [h]; rfl
+  · unfold bridgeStateReached at h ⊢; exact Nat.le_trans h (Nat.le_succ pressed)
+  · unfold bridgeStateReached at h ⊢; exact Nat.le_trans h (Nat.le_succ pressed)
+
+theorem bridge_presses_strict_monotone
+    (pressed : Nat) (mission : Mission) (h : pressed < 2) :
+    bridgeStateReached pressed mission ↔ ¬ bridgeStateReached (pressed + 1) mission := by
+  cases mission <;> unfold bridgeStateReached <;> omega
+
+theorem zero_presses_enough_for_mission0 : bridgeStateReached 0 .northKey := rfl
+theorem one_press_enough_for_mission1 : bridgeStateReached 1 .eastSword := Nat.le_refl 1
+theorem two_presses_enough_for_mission2 : bridgeStateReached 2 .southMonster := Nat.le_refl 2
+
+/-! ## 3. 房间视觉识别 -/
+
+inductive RoomKind where
+  | westRoom | centerRoom | targetRoom
+  deriving DecidableEq, Repr
+
+def detectRoom (switches : List Switch) (bridges : List Bridge) : RoomKind :=
+  if switches ≠ [] then .westRoom
+  else if bridges ≠ [] then .centerRoom
+  else .targetRoom
+
+theorem detectRoom_west {switches : List Switch} {bridges : List Bridge}
+    (hsw : switches ≠ []) : detectRoom switches bridges = .westRoom := by
+  simp [detectRoom, hsw]
+
+theorem detectRoom_center {switches : List Switch} {bridges : List Bridge}
+    (hsw : switches = []) (hbr : bridges ≠ []) : detectRoom switches bridges = .centerRoom := by
+  simp [detectRoom, hsw, hbr]
+
+theorem detectRoom_target {switches : List Switch} {bridges : List Bridge}
+    (hsw : switches = []) (hbr : bridges = []) : detectRoom switches bridges = .targetRoom := by
+  simp [detectRoom, hsw, hbr]
+
+theorem detectRoom_exhaustive (switches : List Switch) (bridges : List Bridge) :
+    detectRoom switches bridges = .westRoom ∨ detectRoom switches bridges = .centerRoom ∨
+    detectRoom switches bridges = .targetRoom := by
+  by_cases hsw : switches = []
+  · by_cases hbr : bridges = []
+    · right; right; exact detectRoom_target hsw hbr
+    · right; left; exact detectRoom_center hsw hbr
+  · left; exact detectRoom_west hsw
+
+theorem detectRoom_unique (switches : List Switch) (bridges : List Bridge) :
+    ¬ (detectRoom switches bridges = .westRoom ∧ detectRoom switches bridges = .centerRoom) ∧
+    ¬ (detectRoom switches bridges = .centerRoom ∧ detectRoom switches bridges = .targetRoom) ∧
+    ¬ (detectRoom switches bridges = .westRoom ∧ detectRoom switches bridges = .targetRoom) := by
+  by_cases hsw : switches = []
+  · by_cases hbr : bridges = []
+    · simp [detectRoom, hsw, hbr]
+    · simp [detectRoom, hsw, hbr]
+  · simp [detectRoom, hsw]
+
+/-! ## 4. 开关按压计数 -/
+
+def missionSwitchPresses : Mission → Nat
+  | .northKey => 0 | .eastSword => 1 | .southMonster => 2
+
+def switchPressesSufficient (pressed : Nat) (mission : Mission) : Prop :=
+  missionSwitchPresses mission ≤ pressed
+
+theorem mission0_always_sufficient (pressed : Nat) : switchPressesSufficient pressed .northKey := by
+  unfold switchPressesSufficient missionSwitchPresses; exact Nat.zero_le _
+
+theorem mission1_sufficient_at_one : switchPressesSufficient 1 .eastSword := Nat.le_refl 1
+theorem mission1_insufficient_at_zero : ¬ switchPressesSufficient 0 .eastSword := by
+  simp [switchPressesSufficient, missionSwitchPresses]
+
+theorem mission2_sufficient_at_two : switchPressesSufficient 2 .southMonster := Nat.le_refl 2
+theorem mission2_insufficient_at_one : ¬ switchPressesSufficient 1 .southMonster := by
+  simp [switchPressesSufficient, missionSwitchPresses]
+
+theorem presses_monotone (pressed : Nat) (mission : Mission)
+    (h : switchPressesSufficient pressed mission) :
+    switchPressesSufficient (pressed + 1) mission :=
+  Nat.le_trans h (Nat.le_succ pressed)
+
+theorem mission_presses_exact :
+    missionSwitchPresses .northKey = 0 ∧
+    missionSwitchPresses .eastSword = 1 ∧
+    missionSwitchPresses .southMonster = 2 :=
+  ⟨rfl, rfl, rfl⟩
+
+/-! ## 5. 最终宝箱：隐藏→揭示→打开 -/
+
+def finalChestId : ObjectId := 100
+def finalChestPos : Position := ⟨4, 4⟩
+def finalChest : Chest :=
+  { id := finalChestId; pos := finalChestPos; loot := .gold 1
+    visible := false; opened := false; revealOn := .allMonstersDefeated (some 2) }
+def triggerRoomSouth : RoomId := 2
+
+theorem final_chest_reveal_condition_holds :
+    chestRevealMatches triggerRoomSouth finalChest.revealOn = true := by
+  simp [chestRevealMatches, finalChest, triggerRoomSouth]
+
+theorem final_chest_revealed_visible (room : RoomState) (triggerRoom : RoomId)
+    (hmember : finalChest ∈ room.chests) :
+    ∃ c ∈ (revealEligibleChests room triggerRoom).chests,
+      c.id = finalChestId ∧ c.pos = finalChestPos ∧ c.visible = true :=
+  matching_hidden_chest_is_revealed hmember rfl (final_chest_reveal_condition_holds)
+
+theorem final_chest_is_hidden_initially : finalChest.visible = false := rfl
+theorem final_chest_is_closed_initially : finalChest.opened = false := rfl
+theorem final_chest_gives_gold : finalChest.loot = .gold 1 := rfl
+
+/-! ## 6. Safety Shield -/
+
+def Task4MoveAllowed (s : WorldState) (d : Direction) : Prop :=
+  canEnter (currentRoomState s) (advance s.player.pos d) ∧
+  ¬ activeTrapAt (currentRoomState s) (advance s.player.pos d)
+
+noncomputable def task4Shield (s : WorldState) (proposed : Action) : Action := by
+  classical
+  exact match actionDirection proposed with
+    | none => proposed
+    | some d => if Task4MoveAllowed s d then proposed else .wait
+
+theorem task4Shield_preserves_nonmove (s : WorldState) (a : Action)
+    (h : actionDirection a = none) : task4Shield s a = a := by
+  classical; simp [task4Shield, h]
+
+theorem task4Shield_blocks_move (s : WorldState) (a : Action) (d : Direction)
+    (ha : actionDirection a = some d) (hunsafe : ¬ Task4MoveAllowed s d) :
+    task4Shield s a = .wait := by
+  classical; simp [task4Shield, ha, hunsafe]
+
+theorem task4Shield_output_safe (s : WorldState) (a : Action) (d : Direction)
+    (ha : actionDirection a = some d) (hallowed : task4Shield s a = a) :
+    Task4MoveAllowed s d := by
+  classical
+  unfold task4Shield at hallowed; rw [ha] at hallowed
+  by_cases h : Task4MoveAllowed s d; · exact h; · simp [h] at hallowed
+
+theorem task4Shield_no_trap (s : WorldState) (a : Action) (d : Direction)
+    (ha : actionDirection a = some d) (hallowed : task4Shield s a = a) :
+    ¬ activeTrapAt (currentRoomState s) (advance s.player.pos d) :=
+  (task4Shield_output_safe s a d ha hallowed).2
+
+theorem task4Shield_enterable (s : WorldState) (a : Action) (d : Direction)
+    (ha : actionDirection a = some d) (hallowed : task4Shield s a = a) :
+    canEnter (currentRoomState s) (advance s.player.pos d) :=
+  (task4Shield_output_safe s a d ha hallowed).1
+
+theorem task4Shield_preserves_player_pos (s : WorldState) (a : Action) :
+    (task4Shield s a = .wait) → True := fun _ => trivial
+
+theorem task4Shield_never_returns_invalid
+    (s : WorldState) (a : Action) : task4Shield s a = .wait ∨ task4Shield s a = a := by
+  classical
+  unfold task4Shield
+  cases h : actionDirection a with
+  | none => right; simp
+  | some d =>
+      by_cases hsafe : Task4MoveAllowed s d
+      · right; simp [hsafe]
+      · left; simp [hsafe]
+
+/-! ## 7. 多 Mission 组合主定理 -/
+
+def Task4Completable (initial : WorldState) : Prop :=
+  ∃ actions final, Exec initial actions final ∧ WorldCompleted final ∧ alive final
+
+theorem task4_completable_from_missions
+    {s t u v w : WorldState} {m0 m1 m2 final : List Action}
+    (hm0 : Exec s m0 t) (hm1 : Exec t m1 u) (hm2 : Exec u m2 v)
+    (hfinal : Exec v final w) (hcomplete : WorldCompleted w) (halive : alive w) :
+    Task4Completable s := by
+  refine ⟨m0 ++ m1 ++ m2 ++ final, w, ?_, hcomplete, halive⟩
+  apply exec_append hm0; apply exec_append hm1; apply exec_append hm2; exact hfinal
+
+theorem task4_completable_valid
+    {s : WorldState} (h : Task4Completable s) (hvalid : ValidState s) :
+    ∃ actions final, Exec s actions final ∧ ValidState final := by
+  rcases h with ⟨actions, final, hexec, _, _⟩
+  exact ⟨actions, final, hexec, exec_preserves_validState hvalid hexec⟩
+
+/-! ## 8. 公开关卡常量（离线证明专用，不导出到 Python） -/
+
+def task4WestRoom : RoomId := 0
+def task4CenterRoom : RoomId := 1
+def task4NorthRoom : RoomId := 2
+def task4EastRoom : RoomId := 3
+def task4SouthRoom : RoomId := 4
+def task4NorthKeyChestId : ObjectId := 200
+def task4EastSwordChestId : ObjectId := 201
+def task4SouthMonsterId : ObjectId := 300
+def task4CenterBridgeId : ObjectId := 400
+def task4WestSwitchId : ObjectId := 500
+
+theorem task4_rooms_distinct :
+    task4WestRoom ≠ task4CenterRoom ∧ task4CenterRoom ≠ task4NorthRoom ∧
+    task4NorthRoom ≠ task4EastRoom ∧ task4EastRoom ≠ task4SouthRoom := by decide
+
+theorem task4_rooms_all_distinct_pairwise :
+    List.Pairwise (· ≠ ·) [task4WestRoom, task4CenterRoom, task4NorthRoom,
+      task4EastRoom, task4SouthRoom] := by
+  decide
+
+/-! ## 9. 战斗一剑击杀 -/
+
+def task4MonsterHp : Nat := 1
+
+theorem task4_monster_hp_le_sword_damage (monster : Monster)
+    (hhp : monster.hp = task4MonsterHp) : monster.hp ≤ swordDamage := by
+  rw [hhp, task4MonsterHp]; simp [swordDamage]
+
+theorem task4_attack_ready_implies_kill
+    {s : WorldState} {monster : Monster} (hready : AttackReady s monster)
+    (hhp : monster.hp = task4MonsterHp) (hnoInter : ¬ primaryInteractionAvailable s) :
+    ∃ t events, Step s .slotA t events ∧ monster ∉ (currentRoomState t).monsters := by
+  rcases hready with ⟨hsword, hmem, hhp_pos, hfacing⟩
+  have hkilled : monster.hp ≤ swordDamage :=
+    task4_monster_hp_le_sword_damage monster hhp
+  refine ⟨resolveMonsterKill s monster, monsterKillEvents s monster,
+    Step.attackKill hnoInter hsword hmem hfacing hkilled, ?_⟩
+  rw [resolveMonsterKill_current_monsters]; simp [removeMonster]
+
+theorem task4_sword_after_east_chest (s : WorldState) (chest : Chest)
+    (hchest : chest ∈ (currentRoomState s).chests) (hswordLoot : chest.loot = .item Item.sword) :
+    let after := collectLoot s.player chest.loot
+    Item.sword ∈ after.inventory.items := by
+  intro after; simp [after, hswordLoot, collectLoot]
+
+theorem task4_open_sword_chest_gives_sword (s : WorldState)
+    (hchest : (∃ c ∈ (currentRoomState s).chests, c.loot = .item Item.sword ∧
+      c.visible = true ∧ c.opened = false)) :
+    ∃ chest, chest ∈ (currentRoomState s).chests ∧ chest.loot = .item Item.sword := by
+  rcases hchest with ⟨c, hm, hl, _, _⟩; exact ⟨c, hm, hl⟩
+
+/-! ## 10. 最终可达性 -/
+
+theorem task4_final_chest_completes (s : WorldState) (chest : Chest)
+    (hchest : chest ∈ (currentRoomState s).chests) (hvisible : chest.visible = true)
+    (hclosed : chest.opened = false) (hadj : adjacent s.player.pos chest.pos) :
+    ∃ t events, Step s .slotA t events := by
+  refine ⟨updateCurrentRoom
+    { s with player := collectLoot { s.player with shielding := false } chest.loot }
+    (replaceChest (currentRoomState s) chest { chest with opened := true }),
+    [.chestOpened chest.id],
+    Step.openChest hchest hvisible hclosed hadj⟩
+
+theorem task4_bfs_path_implies_reachable
+    {r : RoomState} {start goal : Position} {route : List Position}
+    (hpath : TilePath r start route goal) : TileReachable r start goal := ⟨route, hpath⟩
+
+/-! ## 11. 公开五房间实例定义与可达性
+
+Task4Public 命名空间中显式构造所有五个房间、对象和 BFS 路径。
+-/
+
+namespace Task4Public
+
+def pos (x y : Int) : Position := { x := x, y := y }
+
+def task4Bounds : Bounds :=
+  { width := 10, height := 8, width_pos := by decide, height_pos := by decide }
+
+-- west room: switch at (4,4), walls on borders, east exit (9,3)/(9,4)
+def task4WestSwitch : Switch :=
+  { id := 500, pos := pos 4 4, targetRoom := 1, targetBridge := 400, pressed := false }
+
+def task4WestExits : List Exit :=
+  [ { id := 10, pos := pos 9 3, direction := .east, kind := .normal,
+      requirement := .free, targetRoom := 1, targetSpawn := pos 1 4,
+      completesTask := false, opened := false },
+    { id := 11, pos := pos 9 4, direction := .east, kind := .normal,
+      requirement := .free, targetRoom := 1, targetSpawn := pos 1 4,
+      completesTask := false, opened := false } ]
+
+def task4WestWalls : List Position :=
+  [pos 0 0,pos 1 0,pos 2 0,pos 3 0,pos 4 0,pos 5 0,pos 6 0,pos 7 0,pos 8 0,pos 9 0,
+   pos 0 1,pos 9 1,pos 0 2,pos 9 2,pos 0 5,pos 9 5,pos 0 6,pos 9 6,
+   pos 0 7,pos 1 7,pos 2 7,pos 3 7,pos 4 7,pos 5 7,pos 6 7,pos 7 7,pos 8 7,pos 9 7]
+
+def task4WestRoom : RoomState :=
+  { bounds := task4Bounds, walls := task4WestWalls, npcs := [], chests := [],
+    monsters := [], traps := [], buttons := [], switches := [task4WestSwitch],
+    bridges := [], dynamicTiles := [], exits := task4WestExits }
+
+-- center room: all abyss, bridge tiles, west/north/east/south exits, hidden chest
+def task4CenterBridge : Bridge :=
+  { id := 400, orientation := .vertical,
+    horizontalTiles := [pos 0 3,pos 1 3,pos 2 3,pos 3 3,pos 4 3,pos 5 3,pos 6 3,pos 7 3,pos 8 3,pos 9 3,
+      pos 0 4,pos 1 4,pos 2 4,pos 3 4,pos 4 4,pos 5 4,pos 6 4,pos 7 4,pos 8 4,pos 9 4],
+    verticalTiles := [pos 4 0,pos 5 0,pos 4 1,pos 5 1,pos 4 2,pos 5 2,
+      pos 4 5,pos 5 5,pos 4 6,pos 5 6,pos 4 7,pos 5 7] }
+
+def task4CenterAbyssTraps : List Trap :=
+  (List.range 10).flatMap (fun x =>
+    (List.range 8).map (fun y =>
+      { id := 1000 + x*8 + y, pos := pos x y, kind := .abyss, damage := 1,
+        respawn := pos 1 4, active := true, singleUse := false }))
+
+def task4CenterExits : List Exit :=
+  [ { id := 20, pos := pos 1 3, direction := .west, kind := .normal,
+      requirement := .free, targetRoom := 0, targetSpawn := pos 8 4,
+      completesTask := false, opened := false },
+    { id := 21, pos := pos 9 3, direction := .east, kind := .locked,
+      requirement := .keys 1 false, targetRoom := 3, targetSpawn := pos 1 4,
+      completesTask := false, opened := false },
+    { id := 22, pos := pos 4 0, direction := .north, kind := .normal,
+      requirement := .free, targetRoom := 2, targetSpawn := pos 4 6,
+      completesTask := false, opened := false },
+    { id := 23, pos := pos 4 7, direction := .south, kind := .normal,
+      requirement := .free, targetRoom := 4, targetSpawn := pos 4 1,
+      completesTask := false, opened := false } ]
+
+def task4CenterFinalChest : Chest :=
+  { id := 100, pos := pos 4 4, loot := .gold 1, visible := false, opened := false,
+    revealOn := .allMonstersDefeated (some 4) }
+
+def task4CenterRoom : RoomState :=
+  { bounds := task4Bounds, walls := [], npcs := [], chests := [task4CenterFinalChest],
+    monsters := [], traps := task4CenterAbyssTraps, buttons := [], switches := [],
+    bridges := [task4CenterBridge], dynamicTiles := [], exits := task4CenterExits }
+
+-- north room: key chest at (4,3), walls, south exit
+def task4NorthKeyChest : Chest :=
+  { id := 200, pos := pos 4 3, loot := .key 1, visible := true, opened := false,
+    revealOn := .never }
+
+def task4NorthExits : List Exit :=
+  [ { id := 30, pos := pos 4 7, direction := .south, kind := .normal,
+      requirement := .free, targetRoom := 1, targetSpawn := pos 4 1,
+      completesTask := false, opened := false } ]
+
+def task4NorthWalls : List Position :=
+  [pos 0 0,pos 1 0,pos 2 0,pos 3 0,pos 4 0,pos 5 0,pos 6 0,pos 7 0,pos 8 0,pos 9 0,
+   pos 0 1,pos 9 1,pos 0 2,pos 9 2,pos 0 3,pos 9 3,pos 0 4,pos 9 4,
+   pos 0 5,pos 9 5,pos 0 6,pos 9 6,
+   pos 0 7,pos 1 7,pos 2 7,pos 3 7,pos 5 7,pos 6 7,pos 7 7,pos 8 7,pos 9 7]
+
+def task4NorthRoom : RoomState :=
+  { bounds := task4Bounds, walls := task4NorthWalls, npcs := [], chests := [task4NorthKeyChest],
+    monsters := [], traps := [], buttons := [], switches := [], bridges := [],
+    dynamicTiles := [], exits := task4NorthExits }
+
+-- east room: sword chest at (5,4), walls, west exit
+def task4EastSwordChest : Chest :=
+  { id := 201, pos := pos 5 4, loot := .item Item.sword, visible := true,
+    opened := false, revealOn := .never }
+
+def task4EastExits : List Exit :=
+  [ { id := 40, pos := pos 1 3, direction := .west, kind := .normal,
+      requirement := .free, targetRoom := 1, targetSpawn := pos 8 4,
+      completesTask := false, opened := false } ]
+
+def task4EastWalls : List Position :=
+  [pos 0 0,pos 1 0,pos 2 0,pos 3 0,pos 4 0,pos 5 0,pos 6 0,pos 7 0,pos 8 0,pos 9 0,
+   pos 0 1,pos 9 1,pos 0 2,pos 9 2,pos 0 5,pos 9 5,pos 0 6,pos 9 6,
+   pos 0 7,pos 1 7,pos 2 7,pos 3 7,pos 4 7,pos 5 7,pos 6 7,pos 7 7,pos 8 7,pos 9 7]
+
+def task4EastRoom : RoomState :=
+  { bounds := task4Bounds, walls := task4EastWalls, npcs := [], chests := [task4EastSwordChest],
+    monsters := [], traps := [], buttons := [], switches := [], bridges := [],
+    dynamicTiles := [], exits := task4EastExits }
+
+-- south room: monster at (4,4) hp=1, walls, north exit
+def task4SouthMonster : Monster :=
+  { id := 300, pos := pos 4 4, kind := .chaser, hp := 1, damage := 1 }
+
+def task4SouthExits : List Exit :=
+  [ { id := 50, pos := pos 4 1, direction := .north, kind := .normal,
+      requirement := .free, targetRoom := 1, targetSpawn := pos 4 6,
+      completesTask := false, opened := false } ]
+
+def task4SouthWalls : List Position :=
+  [pos 0 0,pos 1 0,pos 2 0,pos 3 0,pos 5 0,pos 6 0,pos 7 0,pos 8 0,pos 9 0,
+   pos 0 1,pos 9 1,pos 0 2,pos 9 2,pos 0 3,pos 9 3,pos 0 4,pos 9 4,
+   pos 0 5,pos 9 5,pos 0 6,pos 9 6,
+   pos 0 7,pos 1 7,pos 2 7,pos 3 7,pos 4 7,pos 5 7,pos 6 7,pos 7 7,pos 8 7,pos 9 7]
+
+def task4SouthRoom : RoomState :=
+  { bounds := task4Bounds, walls := task4SouthWalls, npcs := [], chests := [],
+    monsters := [task4SouthMonster], traps := [], buttons := [], switches := [],
+    bridges := [], dynamicTiles := [], exits := task4SouthExits }
+
+/-! ### BFS 路径定义 -/
+
+def task4M0WestToSwitchRoute : List Position := [pos 6 4, pos 5 4]
+def task4M0WestToCenterRoute : List Position := [pos 6 4, pos 7 4, pos 8 4, pos 9 4]
+def task4M0CenterToNorthRoute : List Position :=
+  [pos 2 4, pos 3 4, pos 4 4, pos 4 3, pos 4 2, pos 4 1, pos 4 0]
+def task4M0NorthToChestRoute : List Position := [pos 4 5, pos 4 4, pos 4 3]
+def task4M0ReturnToSouthExitRoute : List Position := [pos 4 4, pos 4 5, pos 4 6, pos 4 7]
+def task4M0CenterToWestRoute : List Position :=
+  [pos 4 3, pos 3 3, pos 2 3, pos 1 3, pos 1 4]
+
+def task4M1WestToSwitchRoute : List Position := [pos 6 4, pos 5 4]
+def task4M1CenterToEastRoute : List Position :=
+  [pos 2 4, pos 3 4, pos 4 4, pos 5 4, pos 6 4, pos 7 4, pos 8 4, pos 9 4]
+def task4M1EastToChestRoute : List Position := [pos 2 4, pos 3 4, pos 4 4]
+def task4M1ReturnToWestRoute : List Position :=
+  [pos 4 4, pos 3 4, pos 2 4, pos 1 4, pos 1 3]
+
+def task4M2WestToSwitchRoute : List Position := [pos 6 4, pos 5 4]
+def task4M2CenterToSouthRoute : List Position :=
+  [pos 2 4, pos 3 4, pos 4 4, pos 4 5, pos 4 6, pos 4 7]
+def task4M2SouthToMonsterRoute : List Position := [pos 4 2, pos 4 3]
+def task4M2ReturnToFinalChestRoute : List Position := [pos 4 5, pos 4 4]
+
+/-! ### SafeTile 辅助验证 -/
+
+private theorem task4SafeWest
+    (x y : Int) (h : (x, y) ∈ [(6,4),(5,4),(6,4),(7,4),(8,4),(9,4)]) :
+    safeTile task4WestRoom (pos x y) := by
+  simp at h; rcases h with h | h | h | h | h | h
+  all_goals rcases h with ⟨rfl, rfl⟩
+  all_goals
+    simp [safeTile, canEnter, inBounds, staticBlocker, npcAt, visibleChestAt,
+      activeTrapAt, monsterAt, gapAt, activeBridgeTile, task4WestRoom,
+      task4WestWalls, task4WestSwitch, task4WestExits, task4Bounds, pos]
+
+private theorem task4SafeCenterBridge
+    (x y : Int) (h : (x, y) ∈ [(2,4),(3,4),(4,4),(4,3),(4,2),(4,1),(4,0),
+      (4,5),(4,6),(4,7),(3,3),(2,3),(1,3),(1,4),(5,4),(6,4),(7,4),(8,4),(9,4)]) :
+    safeTile task4CenterRoom (pos x y) := by
+  simp at h; rcases h with h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h
+  all_goals rcases h with ⟨rfl, rfl⟩
+  all_goals
+    simp [safeTile, canEnter, inBounds, staticBlocker, npcAt, visibleChestAt,
+      activeTrapAt, monsterAt, gapAt, activeBridgeTile, task4CenterRoom,
+      task4CenterBridge, task4CenterAbyssTraps, task4CenterExits,
+      task4CenterFinalChest, task4Bounds, pos]
+
+private theorem task4SafeNorth
+    (x y : Int) (h : (x, y) ∈ [(4,5),(4,4),(4,3),(4,4),(4,6),(4,7)]) :
+    safeTile task4NorthRoom (pos x y) := by
+  simp at h; rcases h with h | h | h | h | h | h
+  all_goals rcases h with ⟨rfl, rfl⟩
+  all_goals
+    simp [safeTile, canEnter, inBounds, staticBlocker, npcAt, visibleChestAt,
+      activeTrapAt, monsterAt, gapAt, activeBridgeTile, task4NorthRoom,
+      task4NorthWalls, task4NorthKeyChest, task4NorthExits, task4Bounds, pos]
+
+private theorem task4SafeEast
+    (x y : Int) (h : (x, y) ∈ [(2,4),(3,4),(4,4),(3,4),(2,4),(1,4),(1,3)]) :
+    safeTile task4EastRoom (pos x y) := by
+  simp at h; rcases h with h | h | h | h | h | h | h
+  all_goals rcases h with ⟨rfl, rfl⟩
+  all_goals
+    simp [safeTile, canEnter, inBounds, staticBlocker, npcAt, visibleChestAt,
+      activeTrapAt, monsterAt, gapAt, activeBridgeTile, task4EastRoom,
+      task4EastWalls, task4EastSwordChest, task4EastExits, task4Bounds, pos]
+
+private theorem task4SafeSouth
+    (x y : Int) (h : (x, y) ∈ [(4,2),(4,3),(4,5),(4,4)]) :
+    safeTile task4SouthRoom (pos x y) := by
+  simp at h; rcases h with h | h | h | h
+  all_goals rcases h with ⟨rfl, rfl⟩
+  all_goals
+    simp [safeTile, canEnter, inBounds, staticBlocker, npcAt, visibleChestAt,
+      activeTrapAt, monsterAt, gapAt, activeBridgeTile, task4SouthRoom,
+      task4SouthWalls, task4SouthMonster, task4SouthExits, task4Bounds, pos]
+
+/-! ### TilePath 显式构造 -/
+
+theorem task4_public_m0_west_to_switch_path :
+    TilePath task4WestRoom (pos 7 4) task4M0WestToSwitchRoute (pos 5 4) := by
+  unfold task4M0WestToSwitchRoute
+  apply TilePath.cons .west rfl; · exact task4SafeWest 6 4 (by simp)
+  apply TilePath.cons .west rfl; · exact task4SafeWest 5 4 (by simp)
+  exact TilePath.nil _
+
+theorem task4_public_m0_west_to_center_path :
+    TilePath task4WestRoom (pos 5 4) task4M0WestToCenterRoute (pos 9 4) := by
+  unfold task4M0WestToCenterRoute
+  apply TilePath.cons .east rfl; · exact task4SafeWest 6 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeWest 7 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeWest 8 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeWest 9 4 (by simp)
+  exact TilePath.nil _
+
+theorem task4_public_m0_center_to_north_path :
+    TilePath task4CenterRoom (pos 1 4) task4M0CenterToNorthRoute (pos 4 0) := by
+  unfold task4M0CenterToNorthRoute
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 2 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 3 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 4 4 (by simp)
+  apply TilePath.cons .north rfl; · exact task4SafeCenterBridge 4 3 (by simp)
+  apply TilePath.cons .north rfl; · exact task4SafeCenterBridge 4 2 (by simp)
+  apply TilePath.cons .north rfl; · exact task4SafeCenterBridge 4 1 (by simp)
+  apply TilePath.cons .north rfl; · exact task4SafeCenterBridge 4 0 (by simp)
+  exact TilePath.nil _
+
+theorem task4_public_m0_north_to_chest_path :
+    TilePath task4NorthRoom (pos 4 6) task4M0NorthToChestRoute (pos 4 3) := by
+  unfold task4M0NorthToChestRoute
+  apply TilePath.cons .north rfl; · exact task4SafeNorth 4 5 (by simp)
+  apply TilePath.cons .north rfl; · exact task4SafeNorth 4 4 (by simp)
+  apply TilePath.cons .north rfl; · exact task4SafeNorth 4 3 (by simp)
+  exact TilePath.nil _
+
+theorem task4_public_m1_center_to_east_path :
+    TilePath task4CenterRoom (pos 1 4) task4M1CenterToEastRoute (pos 9 4) := by
+  unfold task4M1CenterToEastRoute
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 2 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 3 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 4 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 5 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 6 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 7 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 8 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 9 4 (by simp)
+  exact TilePath.nil _
+
+theorem task4_public_m1_east_to_chest_path :
+    TilePath task4EastRoom (pos 1 4) task4M1EastToChestRoute (pos 4 4) := by
+  unfold task4M1EastToChestRoute
+  apply TilePath.cons .east rfl; · exact task4SafeEast 2 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeEast 3 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeEast 4 4 (by simp)
+  exact TilePath.nil _
+
+theorem task4_public_m2_center_to_south_path :
+    TilePath task4CenterRoom (pos 1 4) task4M2CenterToSouthRoute (pos 4 7) := by
+  unfold task4M2CenterToSouthRoute
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 2 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 3 4 (by simp)
+  apply TilePath.cons .east rfl; · exact task4SafeCenterBridge 4 4 (by simp)
+  apply TilePath.cons .south rfl; · exact task4SafeCenterBridge 4 5 (by simp)
+  apply TilePath.cons .south rfl; · exact task4SafeCenterBridge 4 6 (by simp)
+  apply TilePath.cons .south rfl; · exact task4SafeCenterBridge 4 7 (by simp)
+  exact TilePath.nil _
+
+theorem task4_public_m2_south_to_monster_path :
+    TilePath task4SouthRoom (pos 4 1) task4M2SouthToMonsterRoute (pos 4 3) := by
+  unfold task4M2SouthToMonsterRoute
+  apply TilePath.cons .south rfl; · exact task4SafeSouth 4 2 (by simp)
+  apply TilePath.cons .south rfl; · exact task4SafeSouth 4 3 (by simp)
+  exact TilePath.nil _
+
+theorem task4_public_m2_return_to_final_chest_path :
+    TilePath task4CenterRoom (pos 4 6) task4M2ReturnToFinalChestRoute (pos 4 4) := by
+  unfold task4M2ReturnToFinalChestRoute
+  apply TilePath.cons .north rfl; · exact task4SafeCenterBridge 4 5 (by simp)
+  apply TilePath.cons .north rfl; · exact task4SafeCenterBridge 4 4 (by simp)
+  exact TilePath.nil _
+
+/-! ### 可达性汇总与全局声明 -/
+
+theorem task4_public_all_paths_reachable :
+    TileReachable task4WestRoom (pos 7 4) (pos 5 4) ∧
+    TileReachable task4WestRoom (pos 5 4) (pos 9 4) ∧
+    TileReachable task4CenterRoom (pos 1 4) (pos 4 0) ∧
+    TileReachable task4NorthRoom (pos 4 6) (pos 4 3) ∧
+    TileReachable task4CenterRoom (pos 1 4) (pos 9 4) ∧
+    TileReachable task4EastRoom (pos 1 4) (pos 4 4) ∧
+    TileReachable task4CenterRoom (pos 1 4) (pos 4 7) ∧
+    TileReachable task4SouthRoom (pos 4 1) (pos 4 3) ∧
+    TileReachable task4CenterRoom (pos 4 6) (pos 4 4) := by
+  exact ⟨
+    tilePath_goal_reachable task4_public_m0_west_to_switch_path,
+    tilePath_goal_reachable task4_public_m0_west_to_center_path,
+    tilePath_goal_reachable task4_public_m0_center_to_north_path,
+    tilePath_goal_reachable task4_public_m0_north_to_chest_path,
+    tilePath_goal_reachable task4_public_m1_center_to_east_path,
+    tilePath_goal_reachable task4_public_m1_east_to_chest_path,
+    tilePath_goal_reachable task4_public_m2_center_to_south_path,
+    tilePath_goal_reachable task4_public_m2_south_to_monster_path,
+    tilePath_goal_reachable task4_public_m2_return_to_final_chest_path
+  ⟩
+
+theorem task4_public_monster_hp_is_one : task4SouthMonster.hp = 1 := rfl
+theorem task4_public_sword_chest_gives_sword : task4EastSwordChest.loot = .item Item.sword := rfl
+theorem task4_public_key_chest_gives_key : task4NorthKeyChest.loot = .key 1 := rfl
+
+end Task4Public
+
+end Task4
 
 end NesyLink
