@@ -159,10 +159,9 @@ def annotate_one(image_path: Path, json_path: Path, out_path: Path, *, labels: b
 
 
 def player_offset_for_index(index: int) -> tuple[int, int]:
-    # Keep offsets small enough to remain in the original tile for interior spawns.
-    dx = index % 9 - 4
-    dy = (index * 5) % 9 - 4
-    return dx, dy
+    # Cover almost the full in-tile movement range while keeping the center in the original tile.
+    offsets = [(dx, dy) for dy in range(-7, 8) for dx in range(-7, 8)]
+    return offsets[index % len(offsets)]
 
 
 def make_sheet(image_paths: list[Path], out_path: Path, *, cols: int) -> None:

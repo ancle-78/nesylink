@@ -89,10 +89,19 @@ exit_normal / exit_locked / exit_conditional
 
 ## 3. 生成数据集
 
-当前对齐版本建议生成 2000 张训练图和 200 张测试图：
+当前对齐版本建议生成 3000 张训练图和 300 张测试图：
 
 ```bash
-python -m nesylink.cnn.generate_dataset   --train-dir nesylink/cnn/generated/retrain_aligned/train   --test-dir nesylink/cnn/generated/retrain_aligned/test   --train-count 2000   --test-count 200   --train-seed-start 90000   --test-seed-start 120000   --annotate-test   --labels   --sheet-out nesylink/cnn/generated/retrain_aligned/test_annotated_sheet.png
+python -m nesylink.cnn.generate_dataset \
+  --train-dir nesylink/cnn/generated/retrain_aligned/train \
+  --test-dir nesylink/cnn/generated/retrain_aligned/test \
+  --train-count 3000 \
+  --test-count 300 \
+  --train-seed-start 150000 \
+  --test-seed-start 180000 \
+  --annotate-test \
+  --labels \
+  --sheet-out nesylink/cnn/generated/retrain_aligned/test_annotated_sheet.png
 ```
 
 生成后先看：
@@ -107,7 +116,14 @@ nesylink/cnn/generated/retrain_aligned/dataset_summary.json
 ## 4. 训练
 
 ```bash
-python -m nesylink.cnn.train   --data-dir nesylink/cnn/generated/retrain_aligned/train   --pattern 'train_*.json'   --epochs 40   --batch-size 8   --out nesylink/cnn/checkpoints/tiny_hybrid_cnn_aligned.pt   --preview-out nesylink/cnn/checkpoints/tiny_hybrid_cnn_aligned_preview.png   --device auto
+python -m nesylink.cnn.train \
+  --data-dir nesylink/cnn/generated/retrain_aligned/train \
+  --pattern 'train_*.json' \
+  --epochs 45 \
+  --batch-size 8 \
+  --out nesylink/cnn/checkpoints/tiny_hybrid_cnn_aligned.pt \
+  --preview-out nesylink/cnn/checkpoints/tiny_hybrid_cnn_aligned_preview.png \
+  --device auto
 ```
 
 训练完成后会得到：
@@ -125,18 +141,42 @@ tiny_hybrid_cnn_aligned.weights.pt
 
 注意：类表改过以后，旧的 `tiny_hybrid_cnn_retrain/quality/augmented` checkpoint 不能直接混用。
 
-## 5. 单张图片预测
+## 5. 接入 Perception
+
+`nesylink.vision.classify_frame_cnn(...)` 默认加载：
+
+```text
+nesylink/cnn/checkpoints/tiny_hybrid_cnn_aligned.weights.pt
+```
+
+默认动态阈值是 `0.20`。最终接入输出是 `PixelObservation`，其中：
+
+```text
+静态 grid: 主要来自 CNN tile head
+player / monster: 用 palette 锚点细化最终像素位置，避免多 player、丢 player 和 monster 假阳性
+button: 用 palette 锚点确认，避免 floor 被误判成 button
+```
+
+## 6. 单张图片预测
 
 ```bash
-python -m nesylink.cnn.infer_boxes   --image nesylink/cnn/generated/retrain_aligned/test/test_0000.png   --checkpoint nesylink/cnn/checkpoints/tiny_hybrid_cnn_aligned.weights.pt   --out nesylink/cnn/generated/retrain_aligned/test_0000_prediction.png   --threshold 0.50
+python -m nesylink.cnn.infer_boxes \
+  --image nesylink/cnn/generated/retrain_aligned/test/test_0000.png \
+  --checkpoint nesylink/cnn/checkpoints/tiny_hybrid_cnn_aligned.weights.pt \
+  --out nesylink/cnn/generated/retrain_aligned/test_0000_prediction.png \
+  --threshold 0.50
 ```
 
 如果预测框太少，降低 `--threshold`。如果错误框太多，提高 `--threshold`。
 
-## 6. 单张图片标注
+## 7. 单张图片标注
 
 这一步不是模型预测，只是把 JSON 里的标准答案画出来：
 
 ```bash
-python -m nesylink.cnn.annotate_scene   --image nesylink/cnn/generated/retrain_aligned/test/test_0000.png   --json nesylink/cnn/generated/retrain_aligned/test/test_0000.json   --out nesylink/cnn/generated/retrain_aligned/test/test_0000_label.png   --labels
+python -m nesylink.cnn.annotate_scene \
+  --image nesylink/cnn/generated/retrain_aligned/test/test_0000.png \
+  --json nesylink/cnn/generated/retrain_aligned/test/test_0000.json \
+  --out nesylink/cnn/generated/retrain_aligned/test/test_0000_label.png \
+  --labels
 ```

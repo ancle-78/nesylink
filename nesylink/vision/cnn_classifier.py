@@ -17,7 +17,8 @@ from nesylink.vision.pixel_classifier import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CHECKPOINT = PROJECT_ROOT / "nesylink" / "cnn" / "checkpoints" / "tiny_hybrid_cnn_quality.weights.pt"
+DEFAULT_CHECKPOINT = PROJECT_ROOT / "nesylink" / "cnn" / "checkpoints" / "tiny_hybrid_cnn_aligned.weights.pt"
+PLAYER_CENTER_ADJUST_PX = (-1.5, -4.5)
 
 
 def classify_frame_cnn(
@@ -66,7 +67,12 @@ def _classify_frame_cnn(
 ) -> PixelObservation:
     import torch
 
-    from nesylink.cnn.model import DYNAMIC_CLASSES, dynamic_boxes_from_output
+    from nesylink.cnn.model import (
+        DYNAMIC_CLASSES,
+        dedupe_dynamic_boxes,
+        dynamic_boxes_from_output,
+        suppress_tile_classes,
+    )
 
     map_frame = _map_only(frame)
     checkpoint_path = Path(
@@ -76,11 +82,11 @@ def _classify_frame_cnn(
     )
     selected_device = device or os.environ.get("NESYLINK_CNN_DEVICE", "cpu")
     tile_min_score = _float_setting("NESYLINK_CNN_TILE_THRESHOLD", tile_threshold, 0.50)
-    dynamic_min_score = _float_setting("NESYLINK_CNN_DYNAMIC_THRESHOLD", dynamic_threshold, 0.50)
+    dynamic_min_score = _float_setting("NESYLINK_CNN_DYNAMIC_THRESHOLD", dynamic_threshold, 0.20)
     player_recovery_min_score = _float_setting(
         "NESYLINK_CNN_PLAYER_RECOVERY_THRESHOLD",
         player_recovery_threshold,
-        0.30,
+        0.05,
     )
     top_k = _int_setting("NESYLINK_CNN_DYNAMIC_TOP_K", dynamic_top_k, 8)
 
@@ -90,14 +96,17 @@ def _classify_frame_cnn(
 
     with torch.no_grad():
         output = model(tensor)
-        tile_probs = torch.softmax(output["tile_logits"], dim=1)[0].cpu()
+        tile_logits = suppress_tile_classes(output["tile_logits"], DYNAMIC_CLASSES)
+        tile_probs = torch.softmax(tile_logits, dim=1)[0].cpu()
         tile_scores, tile_class_ids = tile_probs.max(dim=0)
-        dynamic_boxes = dynamic_boxes_from_output(
-            output["dynamic_heatmap_logits"],
-            output["dynamic_box"],
-            min_score=dynamic_min_score,
-            top_k=top_k,
-        )[0]
+        dynamic_boxes = dedupe_dynamic_boxes(
+            dynamic_boxes_from_output(
+                output["dynamic_heatmap_logits"],
+                output["dynamic_box"],
+                min_score=dynamic_min_score,
+                top_k=top_k,
+            )[0]
+        )
         if not any(box.kind == "player" for box in dynamic_boxes):
             recovery_boxes = dynamic_boxes_from_output(
                 output["dynamic_heatmap_logits"],
@@ -108,9 +117,19 @@ def _classify_frame_cnn(
             player_candidates = [box for box in recovery_boxes if box.kind == "player"]
             if player_candidates:
                 dynamic_boxes.append(max(player_candidates, key=lambda box: box.score))
+                dynamic_boxes = dedupe_dynamic_boxes(dynamic_boxes)
 
-    tile_observations = _tile_observations(tile_class_ids.numpy(), tile_scores.numpy(), tile_min_score)
-    entities = _entity_observations(dynamic_boxes, DYNAMIC_CLASSES)
+    tile_class_grid = tile_class_ids.numpy()
+    tile_observations = _tile_observations(tile_class_grid, tile_scores.numpy(), tile_min_score)
+    palette_observation = classify_frame_pixels(map_frame)
+    tile_observations = _refine_button_tiles_with_palette(tile_observations, palette_observation)
+    adjust_player_center = bool(np.any(tile_class_grid == CLASS_TO_ID["npc"]))
+    entities = _entity_observations(
+        dynamic_boxes,
+        DYNAMIC_CLASSES,
+        adjust_player_center=adjust_player_center,
+    )
+    entities = _refine_dynamic_entities_with_palette(palette_observation.entities, entities)
     if not any(entity.kind == "player" for entity in entities):
         raise RuntimeError("CNN did not detect player")
 
@@ -191,15 +210,25 @@ def _tile_observations(
     return tuple(observations)
 
 
-def _entity_observations(dynamic_boxes, dynamic_classes: tuple[str, ...]) -> tuple[EntityObservation, ...]:
+def _entity_observations(
+    dynamic_boxes,
+    dynamic_classes: tuple[str, ...],
+    *,
+    adjust_player_center: bool = False,
+) -> tuple[EntityObservation, ...]:
     del dynamic_classes
     best: dict[tuple[str, tuple[int, int]], EntityObservation] = {}
     for box in dynamic_boxes:
         if box.kind not in {"player", "monster"} or not box.tiles:
             continue
-        tile = box.tiles[0]
         left, top, right, bottom = box.bbox_px
         center = ((left + right) * 0.5, (top + bottom) * 0.5)
+        if box.kind == "player" and adjust_player_center:
+            raw_tile = box.tiles[0]
+            center = _adjust_player_center(center)
+            tile = raw_tile if _is_boundary_tile(raw_tile) else _tile_from_center(center)
+        else:
+            tile = box.tiles[0]
         entity = EntityObservation(
             kind=box.kind,
             bbox=box.bbox_px,
@@ -217,6 +246,79 @@ def _entity_observations(dynamic_boxes, dynamic_classes: tuple[str, ...]) -> tup
         key=lambda item: (item.kind != "player", item.tile[1], item.tile[0], -item.confidence),
     )
     return tuple(entities)
+
+
+def _refine_button_tiles_with_palette(
+    tile_observations: tuple[TileObservation, ...],
+    palette_observation: PixelObservation,
+) -> tuple[TileObservation, ...]:
+    palette_by_tile = {tile.tile: tile for tile in palette_observation.tiles}
+    refined: list[TileObservation] = []
+    for tile in tile_observations:
+        palette_tile = palette_by_tile.get(tile.tile)
+        palette_kind = None if palette_tile is None else palette_tile.kind
+        if palette_kind == "button":
+            refined.append(
+                TileObservation(
+                    kind="button",
+                    tile=tile.tile,
+                    confidence=palette_tile.confidence,
+                    scores={"button": palette_tile.confidence},
+                )
+            )
+        elif tile.kind == "button":
+            refined.append(
+                TileObservation(
+                    kind="floor",
+                    tile=tile.tile,
+                    confidence=tile.scores.get("floor", 0.0),
+                    scores={"floor": tile.scores.get("floor", 0.0)},
+                )
+            )
+        else:
+            refined.append(tile)
+    return tuple(refined)
+
+
+def _refine_dynamic_entities_with_palette(
+    palette_entities: tuple[EntityObservation, ...],
+    entities: tuple[EntityObservation, ...],
+) -> tuple[EntityObservation, ...]:
+    palette_player = next((entity for entity in palette_entities if entity.kind == "player"), None)
+    palette_monsters = tuple(entity for entity in palette_entities if entity.kind == "monster")
+
+    cnn_player = next((entity for entity in entities if entity.kind == "player"), None)
+    cnn_monsters = tuple(entity for entity in entities if entity.kind == "monster")
+
+    refined: list[EntityObservation] = []
+    if palette_player is not None:
+        refined.append(palette_player)
+    elif cnn_player is not None:
+        refined.append(cnn_player)
+
+    del cnn_monsters
+    refined.extend(palette_monsters)
+
+    refined.sort(key=lambda item: (item.kind != "player", item.tile[1], item.tile[0], -item.confidence))
+    return tuple(refined)
+
+
+def _adjust_player_center(center: tuple[float, float]) -> tuple[float, float]:
+    x = min(GRID_WIDTH * TILE_SIZE - 1.0, max(0.0, center[0] + PLAYER_CENTER_ADJUST_PX[0]))
+    y = min(GRID_HEIGHT * TILE_SIZE - 1.0, max(0.0, center[1] + PLAYER_CENTER_ADJUST_PX[1]))
+    return (x, y)
+
+
+def _tile_from_center(center: tuple[float, float]) -> tuple[int, int]:
+    return (
+        min(GRID_WIDTH - 1, max(0, int(center[0] // TILE_SIZE))),
+        min(GRID_HEIGHT - 1, max(0, int(center[1] // TILE_SIZE))),
+    )
+
+
+def _is_boundary_tile(tile: tuple[int, int]) -> bool:
+    x, y = tile
+    return x in {0, GRID_WIDTH - 1} or y in {0, GRID_HEIGHT - 1}
 
 
 def _map_only(frame: np.ndarray) -> np.ndarray:
