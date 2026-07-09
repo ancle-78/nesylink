@@ -96,12 +96,20 @@ inductive BridgeOrientation where
   | horizontal | vertical
   deriving DecidableEq, Repr
 
+inductive ChestRevealCondition where
+  | never
+  | allMonstersDefeated (triggerRoom : Option RoomId := none)
+  deriving DecidableEq, Repr
+
 structure Chest where
   id : ObjectId
   pos : Position
   loot : Loot
   visible : Bool := true
   opened : Bool := false
+  -- `some roomId` 对应 Python reveal_on 中显式指定的触发房间；
+  -- `none` 表示任意房间首次清怪都可触发，`never` 表示没有隐藏揭示机制。
+  revealOn : ChestRevealCondition := .never
   deriving DecidableEq, Repr
 
 structure Monster where
@@ -324,6 +332,13 @@ def spendRequirement (inv : Inventory) : Requirement → Inventory
       spendRequirement (spendRequirement inv left) right
   | _ => inv
 
+def requirementContainsAllMonstersDefeated : Requirement → Bool
+  | .allMonstersDefeated => true
+  | .both left right =>
+      requirementContainsAllMonstersDefeated left ||
+      requirementContainsAllMonstersDefeated right
+  | _ => false
+
 def collectLoot (p : PlayerState) : Loot → PlayerState
   | .key n =>
       { p with inventory := { p.inventory with keys := p.inventory.keys + n } }
@@ -361,6 +376,101 @@ def replaceMonster (r : RoomState) (old fresh : Monster) : RoomState :=
 
 def removeMonster (r : RoomState) (target : Monster) : RoomState :=
   { r with monsters := r.monsters.filter (fun m => m.id != target.id) }
+
+@[simp] theorem removeMonster_bounds (r : RoomState) (target : Monster) :
+    (removeMonster r target).bounds = r.bounds := by
+  rfl
+
+def chestRevealMatches
+    (triggerRoom : RoomId) (condition : ChestRevealCondition) : Bool :=
+  match condition with
+  | .never => false
+  | .allMonstersDefeated none => true
+  | .allMonstersDefeated (some roomId) => roomId == triggerRoom
+
+def revealEligibleChests (room : RoomState) (triggerRoom : RoomId) : RoomState :=
+  { room with chests := room.chests.map (fun chest =>
+      if !chest.visible && chestRevealMatches triggerRoom chest.revealOn then
+        { chest with visible := true }
+      else chest) }
+
+def unlockAllMonstersDefeatedExits (room : RoomState) : RoomState :=
+  { room with exits := room.exits.map (fun exit =>
+      if requirementContainsAllMonstersDefeated exit.requirement then
+        { exit with opened := true }
+      else exit) }
+
+def revealEligibleChestsInWorld
+    (rooms : RoomId → RoomState) (triggerRoom : RoomId) :
+    RoomId → RoomState :=
+  fun roomId => revealEligibleChests (rooms roomId) triggerRoom
+
+/-!
+Python 在击杀怪物后先删除怪物并发放金币；若这次击杀清空了当前房间，则立即
+持久打开清怪条件门，并按 reveal_on 规则遍历所有房间揭示隐藏宝箱。
+-/
+def resolveMonsterKill (s : WorldState) (monster : Monster) : WorldState :=
+  let roomAfterRemoval := removeMonster (currentRoomState s) monster
+  let rewarded : WorldState :=
+    updateCurrentRoom
+      { s with player := rewardPlayer s.player monsterKillGold }
+      roomAfterRemoval
+  if roomAfterRemoval.monsters = [] then
+    let roomAfterUnlock := unlockAllMonstersDefeatedExits roomAfterRemoval
+    let roomsAfterUnlock :=
+      setRoom rewarded.rooms s.currentRoom roomAfterUnlock
+    { rewarded with
+      rooms := revealEligibleChestsInWorld roomsAfterUnlock s.currentRoom }
+  else rewarded
+
+@[simp] theorem revealEligibleChests_bounds
+    (room : RoomState) (triggerRoom : RoomId) :
+    (revealEligibleChests room triggerRoom).bounds = room.bounds := by
+  rfl
+
+@[simp] theorem unlockAllMonstersDefeatedExits_bounds
+    (room : RoomState) :
+    (unlockAllMonstersDefeatedExits room).bounds = room.bounds := by
+  rfl
+
+@[simp] theorem resolveMonsterKill_currentRoom
+    (s : WorldState) (monster : Monster) :
+    (resolveMonsterKill s monster).currentRoom = s.currentRoom := by
+  simp only [resolveMonsterKill]
+  split <;> rfl
+
+@[simp] theorem resolveMonsterKill_roomIds
+    (s : WorldState) (monster : Monster) :
+    (resolveMonsterKill s monster).roomIds = s.roomIds := by
+  simp only [resolveMonsterKill]
+  split <;> rfl
+
+@[simp] theorem resolveMonsterKill_player
+    (s : WorldState) (monster : Monster) :
+    (resolveMonsterKill s monster).player =
+      rewardPlayer s.player monsterKillGold := by
+  simp only [resolveMonsterKill]
+  split <;> rfl
+
+@[simp] theorem resolveMonsterKill_current_bounds
+    (s : WorldState) (monster : Monster) :
+    (currentRoomState (resolveMonsterKill s monster)).bounds =
+      (currentRoomState s).bounds := by
+  simp only [resolveMonsterKill]
+  split <;>
+    simp [currentRoomState, revealEligibleChestsInWorld,
+      updateCurrentRoom, setRoom, unlockAllMonstersDefeatedExits,
+      revealEligibleChests]
+
+@[simp] theorem resolveMonsterKill_current_monsters
+    (s : WorldState) (monster : Monster) :
+    (currentRoomState (resolveMonsterKill s monster)).monsters =
+      (removeMonster (currentRoomState s) monster).monsters := by
+  simp only [resolveMonsterKill]
+  split <;>
+    simp [currentRoomState, revealEligibleChestsInWorld,
+      updateCurrentRoom, setRoom, unlockAllMonstersDefeatedExits,
+      revealEligibleChests]
 
 def replaceButton (r : RoomState) (old fresh : Button) : RoomState :=
   { r with buttons := r.buttons.map (fun b => if b.id = old.id then fresh else b) }
@@ -485,6 +595,7 @@ inductive Event where
   | trapTriggered (id : ObjectId)
   | abyssFall (id : ObjectId)
   | chestOpened (id : ObjectId)
+  | chestRevealed (id : ObjectId)
   | talkedNpc (id : ObjectId)
   | monsterDamaged (id : ObjectId)
   | monsterKilled (id : ObjectId)
@@ -508,6 +619,31 @@ def exitEvents (s : WorldState) (exit : Exit) : List Event :=
   let completionEvents :=
     if exit.completesTask then [.environmentCompleted] else []
   doorEvents ++ roomEvents ++ completionEvents
+
+def newlyUnlockedExitIds (room : RoomState) : List ObjectId :=
+  (room.exits.filter (fun exit =>
+    !exit.opened &&
+    requirementContainsAllMonstersDefeated exit.requirement)).map Exit.id
+
+def newlyRevealedChestIds
+    (room : RoomState) (triggerRoom : RoomId) : List ObjectId :=
+  (room.chests.filter (fun chest =>
+    !chest.visible &&
+    chestRevealMatches triggerRoom chest.revealOn)).map Chest.id
+
+def newlyRevealedChestIdsInWorld
+    (s : WorldState) (triggerRoom : RoomId) : List ObjectId :=
+  s.roomIds.flatMap (fun roomId =>
+    newlyRevealedChestIds (s.rooms roomId) triggerRoom)
+
+def monsterKillEvents (s : WorldState) (monster : Monster) : List Event :=
+  let roomAfterRemoval := removeMonster (currentRoomState s) monster
+  if roomAfterRemoval.monsters = [] then
+    [.monsterKilled monster.id] ++
+    (newlyUnlockedExitIds roomAfterRemoval).map Event.doorOpened ++
+    (newlyRevealedChestIdsInWorld s s.currentRoom).map Event.chestRevealed
+  else
+    [.monsterKilled monster.id]
 
 def validPlayerPosition (s : WorldState) : Prop :=
   let r := currentRoomState s
@@ -732,7 +868,7 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
             { monster with hp := monster.hp - swordDamage }))
         [.monsterDamaged monster.id]
 
-  -- 击杀攻击：从房间怪物列表删除目标，并把配置的击杀金币加入背包。
+  -- 击杀攻击：删除目标并发放金币；若清空房间，同时结算清怪门和隐藏宝箱。
   | attackKill {s : WorldState} {monster : Monster}
       (hnoInteraction : ¬ primaryInteractionAvailable s)
       (hsword : Item.sword ∈ s.player.inventory.items)
@@ -740,10 +876,8 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
       (htarget : monster.pos = advance s.player.pos s.player.facing)
       (hkilled : monster.hp ≤ swordDamage) :
       Step s .slotA
-        (updateCurrentRoom
-          { s with player := rewardPlayer s.player monsterKillGold }
-          (removeMonster (currentRoomState s) monster))
-        [.monsterKilled monster.id]
+        (resolveMonsterKill s monster)
+        (monsterKillEvents s monster)
 
   -- 有盾时 slot B 激活一次性格挡；没有盾时该动作不能凭空产生格挡能力。
   | shield {s : WorldState}
@@ -1045,10 +1179,10 @@ theorem step_preserves_validState
       · exact hvalid.2
   | @attackKill monster hnoInteraction hsword hmember htarget hkilled =>
       constructor
-      · simpa [currentRoomState, updateCurrentRoom, setRoom, removeMonster,
-          rewardPlayer]
-          using hvalid.1
-      · exact hvalid.2
+      · rw [resolveMonsterKill_current_bounds, resolveMonsterKill_player]
+        simpa [rewardPlayer] using hvalid.1
+      · rw [resolveMonsterKill_player]
+        simpa [rewardPlayer] using hvalid.2
   | shield hshield =>
       exact hvalid
   | shieldUnavailable hshield =>
@@ -1081,7 +1215,8 @@ theorem step_preserves_roomIds
     {s t : WorldState} {a : Action} {events : List Event}
     (hstep : Step s a t events) :
     t.roomIds = s.roomIds := by
-  cases hstep <;> rfl
+  cases hstep <;> try rfl
+  exact resolveMonsterKill_roomIds _ _
 
 theorem step_currentRoom_remains_known
     {s t : WorldState} {a : Action} {events : List Event}
@@ -1214,6 +1349,83 @@ theorem damaging_attack_reduces_monster_hp
     (hsurvives : power < monster.hp) :
     ({ monster with hp := monster.hp - power }).hp < monster.hp := by
   exact Nat.sub_lt (Nat.zero_lt_of_lt hsurvives) hpower
+
+/-! ### 清怪后的隐藏宝箱与条件门
+
+下面两条存在性定理直接刻画 Python 结算结果：符合 reveal_on 的隐藏宝箱在
+更新后列表中仍是同一 ID、同一坐标且已可见；包含清怪条件的出口同理仍在
+列表中、坐标不变且 `opened = true`。
+-/
+
+theorem matching_hidden_chest_is_revealed
+    {room : RoomState} {chest : Chest} {triggerRoom : RoomId}
+    (hmember : chest ∈ room.chests)
+    (hhidden : chest.visible = false)
+    (hmatch : chestRevealMatches triggerRoom chest.revealOn = true) :
+    ∃ revealed ∈ (revealEligibleChests room triggerRoom).chests,
+      revealed.id = chest.id ∧
+      revealed.pos = chest.pos ∧
+      revealed.visible = true := by
+  let updateChest := fun candidate : Chest =>
+    if !candidate.visible &&
+        chestRevealMatches triggerRoom candidate.revealOn then
+      { candidate with visible := true }
+    else candidate
+  have hmapped : updateChest chest ∈ room.chests.map updateChest := by
+    exact List.mem_map_of_mem hmember
+  refine ⟨{ chest with visible := true }, ?_, rfl, rfl, rfl⟩
+  simpa [revealEligibleChests, updateChest, hhidden, hmatch] using hmapped
+
+theorem clearing_requirement_exit_is_opened
+    {room : RoomState} {exit : Exit}
+    (hmember : exit ∈ room.exits)
+    (hrequirement :
+      requirementContainsAllMonstersDefeated exit.requirement = true) :
+    ∃ opened ∈ (unlockAllMonstersDefeatedExits room).exits,
+      opened.id = exit.id ∧
+      opened.pos = exit.pos ∧
+      opened.opened = true := by
+  let updateExit := fun candidate : Exit =>
+    if requirementContainsAllMonstersDefeated candidate.requirement then
+      { candidate with opened := true }
+    else candidate
+  have hmapped : updateExit exit ∈ room.exits.map updateExit := by
+    exact List.mem_map_of_mem hmember
+  refine ⟨{ exit with opened := true }, ?_, rfl, rfl, rfl⟩
+  simpa [unlockAllMonstersDefeatedExits, updateExit, hrequirement] using hmapped
+
+theorem revealEligibleChests_preserves_chest_positions
+    (room : RoomState) (triggerRoom : RoomId) :
+    (revealEligibleChests room triggerRoom).chests.map Chest.pos =
+      room.chests.map Chest.pos := by
+  simp [revealEligibleChests, List.map_map]
+  intro chest hmember
+  split <;> rfl
+
+theorem unlockAllMonstersDefeatedExits_preserves_exit_positions
+    (room : RoomState) :
+    (unlockAllMonstersDefeatedExits room).exits.map Exit.pos =
+      room.exits.map Exit.pos := by
+  simp [unlockAllMonstersDefeatedExits, List.map_map]
+  intro exit hmember
+  split <;> rfl
+
+theorem resolveMonsterKill_preserves_validState
+    {s : WorldState} {monster : Monster}
+    (hvalid : ValidState s) :
+    ValidState (resolveMonsterKill s monster) := by
+  constructor
+  · rw [resolveMonsterKill_current_bounds, resolveMonsterKill_player]
+    simpa [rewardPlayer] using hvalid.1
+  · rw [resolveMonsterKill_player]
+    simpa [rewardPlayer] using hvalid.2
+
+theorem monster_kill_without_room_clear_has_no_clear_events
+    {s : WorldState} {monster : Monster}
+    (hremaining :
+      (removeMonster (currentRoomState s) monster).monsters ≠ []) :
+    monsterKillEvents s monster = [.monsterKilled monster.id] := by
+  simp [monsterKillEvents, hremaining]
 
 -- 机关性质：按钮一经设置即为 pressed；桥旋转两次回到原朝向。
 theorem pressing_button_is_monotone (b : Button) :
@@ -2439,11 +2651,7 @@ def task2PublicAfterFirstHit : WorldState :=
     (replaceMonster task2PublicRoom task2PublicMonster task2PublicDamagedMonster)
 
 def task2PublicAfterKill : WorldState :=
-  updateCurrentRoom
-    { task2PublicAfterFirstHit with
-      player := rewardPlayer task2PublicAfterFirstHit.player monsterKillGold }
-    (removeMonster (currentRoomState task2PublicAfterFirstHit)
-      task2PublicDamagedMonster)
+  resolveMonsterKill task2PublicAfterFirstHit task2PublicDamagedMonster
 
 theorem task2_public_first_attack_damages :
     Step task2PublicNearMonsterWorld .slotA task2PublicAfterFirstHit
@@ -2462,7 +2670,8 @@ theorem task2_public_first_attack_damages :
 
 theorem task2_public_second_attack_kills :
     Step task2PublicAfterFirstHit .slotA task2PublicAfterKill
-      [.monsterKilled task2PublicDamagedMonster.id] := by
+      (monsterKillEvents task2PublicAfterFirstHit
+        task2PublicDamagedMonster) := by
   apply Step.attackKill (monster := task2PublicDamagedMonster)
   · simp [primaryInteractionAvailable, openChestInteractionAvailable,
       npcInteractionAvailable, switchInteractionAvailable,
@@ -2487,7 +2696,8 @@ theorem task2_public_combat_exec :
 
 theorem task2_public_combat_clears_monster :
     (currentRoomState task2PublicAfterKill).monsters = [] := by
-  simp [task2PublicAfterKill, task2PublicAfterFirstHit,
+  rw [task2PublicAfterKill, resolveMonsterKill_current_monsters]
+  simp [task2PublicAfterFirstHit,
     task2PublicDamagedMonster, task2PublicMonster, task2PublicRoom,
     task2PublicNearMonsterWorld, currentRoomState, updateCurrentRoom,
     setRoom, replaceMonster, removeMonster]
