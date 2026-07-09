@@ -1003,6 +1003,27 @@ inductive EngineTick : WorldState → Action → WorldState → Prop where
       AutonomousExec afterPlayer t →
       EngineTick s action t
 
+/-!
+`EngineExec` 是策略层应使用的完整 tick 轨迹。动作列表只记录玩家每个 tick
+提交的动作；怪物移动、接触和完成结算仍由相应 `EngineTick` 内部的
+`AutonomousExec` 承担，不会伪装成额外玩家 WAIT。
+-/
+inductive EngineExec : WorldState → List Action → WorldState → Prop where
+  | nil {s : WorldState} : EngineExec s [] s
+  | cons {s t u : WorldState} {action : Action} {actions : List Action} :
+      EngineTick s action t →
+      EngineExec t actions u →
+      EngineExec s (action :: actions) u
+
+theorem engineExec_append
+    {s t u : WorldState} {xs ys : List Action}
+    (h₁ : EngineExec s xs t) (h₂ : EngineExec t ys u) :
+    EngineExec s (xs ++ ys) u := by
+  induction h₁ with
+  | nil => simpa using h₂
+  | cons htick hrest ih =>
+      exact EngineExec.cons htick (ih h₂)
+
 theorem dead_state_has_no_player_step
     {s t : WorldState} {a : Action} {events : List Event}
     (hdead : dead s) :
@@ -1275,6 +1296,16 @@ theorem engineTick_preserves_validState
         step_preserves_validState hvalid hplayer.step
       exact autonomousExec_preserves_validState hafter hautonomous
 
+theorem engineExec_preserves_validState
+    {s t : WorldState} {actions : List Action}
+    (hvalid : ValidState s)
+    (hexec : EngineExec s actions t) :
+    ValidState t := by
+  induction hexec with
+  | nil => exact hvalid
+  | cons htick hrest ih =>
+      exact ih (engineTick_preserves_validState hvalid htick)
+
 -- 通行性分解：从 canEnter 可以直接推出界内、非墙和非可见宝箱。
 theorem canEnter_inBounds {r : RoomState} {p : Position}
     (h : canEnter r p) :
@@ -1522,6 +1553,40 @@ theorem exec_append {s t u : WorldState} {xs ys : List Action}
   | nil => simpa using h₂
   | cons hstep hrest ih =>
       exact Exec.cons hstep (ih h₂)
+
+theorem autonomousExec_has_microstep_trace
+    {s t : WorldState}
+    (h : AutonomousExec s t) :
+    ∃ actions, Exec s actions t := by
+  induction h with
+  | nil =>
+      exact ⟨[], Exec.nil⟩
+  | cons hstep hrest ih =>
+      rcases ih with ⟨actions, hactions⟩
+      exact ⟨.wait :: actions, Exec.cons hstep.step hactions⟩
+
+theorem engineTick_has_microstep_trace
+    {s t : WorldState} {action : Action}
+    (h : EngineTick s action t) :
+    ∃ actions, Exec s actions t := by
+  cases h with
+  | mk hplayer hautonomous =>
+      rcases autonomousExec_has_microstep_trace hautonomous with
+        ⟨actions, hactions⟩
+      exact ⟨action :: actions, Exec.cons hplayer.step hactions⟩
+
+theorem engineExec_has_microstep_trace
+    {s t : WorldState} {actions : List Action}
+    (h : EngineExec s actions t) :
+    ∃ microActions, Exec s microActions t := by
+  induction h with
+  | nil =>
+      exact ⟨[], Exec.nil⟩
+  | cons htick hrest ih =>
+      rcases engineTick_has_microstep_trace htick with
+        ⟨tickActions, htickExec⟩
+      rcases ih with ⟨restActions, hrestExec⟩
+      exact ⟨tickActions ++ restActions, exec_append htickExec hrestExec⟩
 
 theorem exec_nil_iff {s t : WorldState} :
     Exec s [] t ↔ t = s := by
@@ -2782,6 +2847,31 @@ theorem task2_public_all_navigation_phases_reachable :
     task2_public_exit_phase_reachable
   ⟩
 
+def Task2SafelyCompletable (initial : WorldState) : Prop :=
+  ∃ actions final,
+    Exec initial actions final ∧
+    Task2Goal final ∧
+    alive final ∧
+    ValidState final
+
+theorem task2_engine_execution_is_safe_and_complete
+    {initial final : WorldState} {playerActions : List Action}
+    (hvalid : ValidState initial)
+    (hexec : EngineExec initial playerActions final)
+    (hgoal : Task2Goal final)
+    (halive : alive final) :
+    Task2SafelyCompletable initial := by
+  rcases engineExec_has_microstep_trace hexec with
+    ⟨microActions, hmicro⟩
+  exact ⟨
+    microActions,
+    final,
+    hmicro,
+    hgoal,
+    halive,
+    engineExec_preserves_validState hvalid hexec
+  ⟩
+
 end Task2
 
 /-!
@@ -3145,6 +3235,86 @@ theorem reachable_chest_has_priority_over_button
         reachableButtons := [button] }).kind = .openChest := by
   rfl
 
+/-! ### 高层目标到局部控制器的 refinement 契约
+
+`Task5GoalAchieved` 给出每类高层目标的可检查后置条件。
+`Task5ControllerRefinesSelection` 不允许控制器自行换目标：它必须执行
+`chooseTask5Goal` 的结果，并用完整 `EngineExec` 轨迹提供达成证书。
+-/
+
+def Task5GoalAchieved (goal : Task5Goal) (final : WorldState) : Prop :=
+  match goal.kind, goal.target with
+  | .slayMonster, some p =>
+      final.currentRoom = goal.room ∧
+      ¬ monsterAt (currentRoomState final) p
+  | .openChest, some p =>
+      final.currentRoom = goal.room ∧
+      ∃ chest ∈ (currentRoomState final).chests,
+        chest.pos = p ∧ chest.opened = true
+  | .pressButton, some p =>
+      final.currentRoom = goal.room ∧
+      ∃ button ∈ (currentRoomState final).buttons,
+        button.pos = p ∧ button.pressed = true
+  | .goExit, some _ | .backtrack, some _ =>
+      final.currentRoom ≠ goal.room
+  | .wait, _ => True
+  | _, _ => False
+
+def Task5ControllerRefinesSelection
+    (initial : WorldState) (candidates : Task5Candidates) : Prop :=
+  candidates.room = initial.currentRoom ∧
+  let goal := chooseTask5Goal candidates
+  goal.kind = .wait ∨
+  ∃ actions final,
+    EngineExec initial actions final ∧
+    Task5GoalAchieved goal final
+
+theorem refined_controller_uses_selected_goal
+    {initial : WorldState} {candidates : Task5Candidates}
+    (hrefines : Task5ControllerRefinesSelection initial candidates)
+    (hnonwait : (chooseTask5Goal candidates).kind ≠ .wait) :
+    ∃ actions final,
+      EngineExec initial actions final ∧
+      Task5GoalAchieved (chooseTask5Goal candidates) final := by
+  rcases hrefines with ⟨hroom, hresult⟩
+  rcases hresult with hwait | hexec
+  · exact False.elim (hnonwait hwait)
+  · exact hexec
+
+theorem refined_chest_controller_opens_visual_candidate
+    {initial final : WorldState} {candidates : Task5Candidates}
+    {p : Position} {actions : List Action}
+    (hselected : chooseTask5Goal candidates =
+      { kind := .openChest, room := candidates.room, target := some p })
+    (_hexec : EngineExec initial actions final)
+    (hachieved :
+      Task5GoalAchieved (chooseTask5Goal candidates) final) :
+    p ∈ candidates.reachableChests ∧
+    ∃ chest ∈ (currentRoomState final).chests,
+      chest.pos = p ∧ chest.opened = true := by
+  have hcandidate :
+      p ∈ candidates.reachableChests :=
+    chosen_chest_came_from_visual_candidates hselected
+  rw [hselected] at hachieved
+  exact ⟨hcandidate, hachieved.2⟩
+
+theorem refined_exit_controller_changes_room
+    {initial final : WorldState} {candidates : Task5Candidates}
+    {p : Position} {d : Direction} {actions : List Action}
+    (hselected : chooseTask5Goal candidates =
+      { kind := .goExit, room := candidates.room,
+        target := some p, direction := some d })
+    (_hexec : EngineExec initial actions final)
+    (hachieved :
+      Task5GoalAchieved (chooseTask5Goal candidates) final) :
+    ((d, p) ∈ candidates.visibleLockedExits ∨
+      (d, p) ∈ candidates.visibleOpenExits) ∧
+    final.currentRoom ≠ candidates.room := by
+  have hcandidate :=
+    chosen_exit_came_from_observed_or_backtrack_candidates hselected
+  rw [hselected] at hachieved
+  exact ⟨hcandidate, hachieved⟩
+
 /-! ## 4. Task5 的动作模式、队列中断和最终安全层
 
 普通探索必须使用 `safeTile` 并远离怪物邻域。战斗和出口模式可以靠近怪物，
@@ -3207,6 +3377,45 @@ theorem task5_allowed_move_avoids_learned_blocked_edge
     ¬ learnedMoveBlocked memory roomId source d :=
   h.2.1
 
+def ShieldInventorySound (hasShield : Bool) (s : WorldState) : Prop :=
+  hasShield = true ↔ Item.shield ∈ s.player.inventory.items
+
+def Task5VerifiedMoveAllowed
+    (mode : MoveMode) (hasShield : Bool)
+    (memory : Task5Memory) (s : WorldState) (d : Direction) : Prop :=
+  let target := advance s.player.pos d
+  Task5MoveAllowed mode hasShield memory s.currentRoom
+      (currentRoomState s) s.player.pos target d ∧
+  ShieldInventorySound hasShield s ∧
+  (mode = .rush →
+    ¬ OutsideMonsterDanger (currentRoomState s) target →
+    s.player.shielding = true)
+
+theorem verified_move_is_enterable
+    {mode : MoveMode} {hasShield : Bool}
+    {memory : Task5Memory} {s : WorldState} {d : Direction}
+    (h : Task5VerifiedMoveAllowed mode hasShield memory s d) :
+    canEnter (currentRoomState s) (advance s.player.pos d) :=
+  task5_allowed_move_is_enterable h.1
+
+theorem verified_shield_flag_means_owned
+    {mode : MoveMode} {hasShield : Bool}
+    {memory : Task5Memory} {s : WorldState} {d : Direction}
+    (h : Task5VerifiedMoveAllowed mode hasShield memory s d)
+    (hflag : hasShield = true) :
+    Item.shield ∈ s.player.inventory.items :=
+  h.2.1.mp hflag
+
+theorem verified_rush_into_danger_has_active_shield
+    {hasShield : Bool} {memory : Task5Memory}
+    {s : WorldState} {d : Direction}
+    (h : Task5VerifiedMoveAllowed .rush hasShield memory s d)
+    (hdanger :
+      ¬ OutsideMonsterDanger (currentRoomState s)
+        (advance s.player.pos d)) :
+    s.player.shielding = true :=
+  h.2.2 rfl hdanger
+
 noncomputable def task5Shield
     (mode : MoveMode) (hasShield : Bool)
     (memory : Task5Memory) (s : WorldState) (proposed : Action) : Action := by
@@ -3214,8 +3423,7 @@ noncomputable def task5Shield
   exact match actionDirection proposed with
     | none => proposed
     | some d =>
-        if Task5MoveAllowed mode hasShield memory s.currentRoom
-            (currentRoomState s) s.player.pos (advance s.player.pos d) d
+        if Task5VerifiedMoveAllowed mode hasShield memory s d
         then proposed
         else .wait
 
@@ -3224,8 +3432,7 @@ theorem task5Shield_blocks_disallowed_move
     (memory : Task5Memory) (s : WorldState)
     (a : Action) (d : Direction)
     (ha : actionDirection a = some d)
-    (hunsafe : ¬ Task5MoveAllowed mode hasShield memory s.currentRoom
-      (currentRoomState s) s.player.pos (advance s.player.pos d) d) :
+    (hunsafe : ¬ Task5VerifiedMoveAllowed mode hasShield memory s d) :
     task5Shield mode hasShield memory s a = .wait := by
   classical
   simp [task5Shield, ha, hunsafe]
@@ -3241,9 +3448,8 @@ theorem task5Shield_allowed_move_is_enterable
   unfold task5Shield at hallowed
   rw [ha] at hallowed
   by_cases hs :
-      Task5MoveAllowed mode hasShield memory s.currentRoom
-        (currentRoomState s) s.player.pos (advance s.player.pos d) d
-  · exact task5_allowed_move_is_enterable hs
+      Task5VerifiedMoveAllowed mode hasShield memory s d
+  · exact verified_move_is_enterable hs
   · simp [hs] at hallowed
     have himpossible : actionDirection Action.wait = some d := by
       rw [hallowed]
@@ -3254,15 +3460,13 @@ def Task5QueueMustInterrupt
     (mode : MoveMode) (hasShield : Bool)
     (memory : Task5Memory) (s : WorldState) (nextAction : Action) : Prop :=
   ∃ d, actionDirection nextAction = some d ∧
-    ¬ Task5MoveAllowed mode hasShield memory s.currentRoom
-      (currentRoomState s) s.player.pos (advance s.player.pos d) d
+    ¬ Task5VerifiedMoveAllowed mode hasShield memory s d
 
 theorem task5_unsafe_queued_move_is_interrupted
     {mode : MoveMode} {hasShield : Bool}
     {memory : Task5Memory} {s : WorldState} {a : Action} {d : Direction}
     (ha : actionDirection a = some d)
-    (hunsafe : ¬ Task5MoveAllowed mode hasShield memory s.currentRoom
-      (currentRoomState s) s.player.pos (advance s.player.pos d) d) :
+    (hunsafe : ¬ Task5VerifiedMoveAllowed mode hasShield memory s d) :
     Task5QueueMustInterrupt mode hasShield memory s a :=
   ⟨d, ha, hunsafe⟩
 
@@ -3369,6 +3573,18 @@ def RequiredRoomsReachable
     (graph : List RoomEdge) (start : RoomId) (required : List RoomId) : Prop :=
   ∀ room, room ∈ required → RoomReachable graph start room
 
+def VisitedRoomsChestsOpened
+    (s : WorldState) (visited : List RoomId) : Prop :=
+  ∀ roomId, roomId ∈ visited →
+    ∀ chest, chest ∈ (s.rooms roomId).chests →
+      chest.opened = true
+
+def VisitedRoomsChestsVisible
+    (s : WorldState) (visited : List RoomId) : Prop :=
+  ∀ roomId, roomId ∈ visited →
+    ∀ chest, chest ∈ (s.rooms roomId).chests →
+      chest.visible = true
+
 theorem fair_exploration_visits_all_required_rooms
     {graph : List RoomEdge} {start : RoomId}
     {required visited : List RoomId}
@@ -3394,6 +3610,13 @@ def Task5CompletedGoal (s : WorldState) : Prop :=
 def Task5Completable (initial : WorldState) : Prop :=
   ∃ actions final, Exec initial actions final ∧ Task5CompletedGoal final
 
+def Task5SafelyCompletable (initial : WorldState) : Prop :=
+  ∃ actions final,
+    Exec initial actions final ∧
+    Task5CompletedGoal final ∧
+    alive final ∧
+    ValidState final
+
 def AllObjectiveChestsVisible (s : WorldState) : Prop :=
   ∀ roomId, roomId ∈ s.roomIds →
     ∀ chest, chest ∈ (s.rooms roomId).chests →
@@ -3403,6 +3626,34 @@ def ChestSchedulerComplete (s : WorldState) : Prop :=
   ∀ roomId, roomId ∈ s.roomIds →
     ∀ chest, chest ∈ (s.rooms roomId).chests →
       chest.opened = true
+
+theorem fair_exploration_and_local_service_complete_scheduler
+    {s : WorldState} {graph : List RoomEdge} {start : RoomId}
+    {visited : List RoomId}
+    (hstart : start ∈ visited)
+    (hclosed : FairExplorationClosed graph visited)
+    (hreachable : RequiredRoomsReachable graph start s.roomIds)
+    (hservice : VisitedRoomsChestsOpened s visited) :
+    ChestSchedulerComplete s := by
+  intro roomId hroom chest hchest
+  have hvisited : roomId ∈ visited :=
+    fair_exploration_visits_every_reachable_room
+      hstart hclosed (hreachable roomId hroom)
+  exact hservice roomId hvisited chest hchest
+
+theorem fair_exploration_and_local_reveal_make_chests_visible
+    {s : WorldState} {graph : List RoomEdge} {start : RoomId}
+    {visited : List RoomId}
+    (hstart : start ∈ visited)
+    (hclosed : FairExplorationClosed graph visited)
+    (hreachable : RequiredRoomsReachable graph start s.roomIds)
+    (hvisible : VisitedRoomsChestsVisible s visited) :
+    AllObjectiveChestsVisible s := by
+  intro roomId hroom chest hchest
+  have hvisited : roomId ∈ visited :=
+    fair_exploration_visits_every_reachable_room
+      hstart hclosed (hreachable roomId hroom)
+  exact hvisible roomId hvisited chest hchest
 
 theorem visibility_and_fair_scheduler_open_all_chests
     {s : WorldState}
@@ -3476,6 +3727,82 @@ theorem task5_policy_complete_under_assumptions
       h.every_objective_chest_visible h.fair_chest_scheduler
   exact task5_completable_after_all_chests_opened
     h.planner_execution hchests
+
+/-!
+加强版主定理不再直接假设 `ChestSchedulerComplete`。它从完整 tick 轨迹、房间图
+公平闭包、所有目标房间可达，以及“已访问房间由局部控制器完成开箱/揭示”
+推导全局宝箱目标，同时保留最终存活与状态有效性。
+-/
+
+structure Task5VerifiedAssumptions
+    (initial allOpened : WorldState) (playerActions : List Action)
+    (memory : Task5Memory) (graph : List RoomEdge)
+    (start : RoomId) (visited : List RoomId) : Prop where
+  symbolic_memory_sound : Task5MemorySound allOpened memory
+  initial_valid : ValidState initial
+  tick_execution : EngineExec initial playerActions allOpened
+  final_alive : alive allOpened
+  start_visited : start ∈ visited
+  fair_exploration_closed : FairExplorationClosed graph visited
+  all_rooms_reachable :
+    RequiredRoomsReachable graph start allOpened.roomIds
+  visited_chests_opened :
+    VisitedRoomsChestsOpened allOpened visited
+  visited_chests_visible :
+    VisitedRoomsChestsVisible allOpened visited
+  objective_chest_exists :
+    ∃ roomId ∈ allOpened.roomIds,
+      ∃ chest, chest ∈ (allOpened.rooms roomId).chests
+
+theorem task5_verified_policy_is_safe_and_complete
+    {initial allOpened : WorldState} {playerActions : List Action}
+    {memory : Task5Memory} {graph : List RoomEdge}
+    {start : RoomId} {visited : List RoomId}
+    (h : Task5VerifiedAssumptions initial allOpened playerActions
+      memory graph start visited) :
+    Task5SafelyCompletable initial := by
+  have hscheduled : ChestSchedulerComplete allOpened :=
+    fair_exploration_and_local_service_complete_scheduler
+      h.start_visited h.fair_exploration_closed
+      h.all_rooms_reachable h.visited_chests_opened
+  have hvisible : AllObjectiveChestsVisible allOpened :=
+    fair_exploration_and_local_reveal_make_chests_visible
+      h.start_visited h.fair_exploration_closed
+      h.all_rooms_reachable h.visited_chests_visible
+  have hnonempty : allOpened.roomIds ≠ [] := by
+    intro hempty
+    rcases h.objective_chest_exists with
+      ⟨roomId, hroom, chest, hchest⟩
+    rw [hempty] at hroom
+    simp at hroom
+  have hchests : allWorldChestsOpened allOpened :=
+    visibility_and_fair_scheduler_open_all_chests
+      hnonempty h.objective_chest_exists hvisible hscheduled
+  rcases engineExec_has_microstep_trace h.tick_execution with
+    ⟨microActions, hmicro⟩
+  have hcompleteStep :
+      Step allOpened .wait { allOpened with completed := true }
+        [.environmentCompleted] :=
+    Step.completeAllChests hchests
+  have hcompleteExec :
+      Exec allOpened [.wait] { allOpened with completed := true } :=
+    Exec.cons hcompleteStep Exec.nil
+  have hall :
+      Exec initial (microActions ++ [.wait])
+        { allOpened with completed := true } :=
+    exec_append hmicro hcompleteExec
+  refine ⟨
+    microActions ++ [.wait],
+    { allOpened with completed := true },
+    hall,
+    rfl,
+    ?_,
+    ?_
+  ⟩
+  · exact h.final_alive
+  · exact step_preserves_validState
+      (engineExec_preserves_validState h.initial_valid h.tick_execution)
+      hcompleteStep
 
 /-! ## 8. 公开 Task5 四房间图实例
 
