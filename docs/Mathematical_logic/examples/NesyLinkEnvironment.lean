@@ -81,6 +81,9 @@ inductive Loot where
   | item (value : Item)
   deriving DecidableEq, Repr
 
+def swordDamage : Nat := 1
+def monsterKillGold : Nat := 1
+
 inductive TrapKind where
   | spike | abyss
   deriving DecidableEq, Repr
@@ -365,6 +368,9 @@ def replaceButton (r : RoomState) (old fresh : Button) : RoomState :=
 def replaceSwitch (r : RoomState) (old fresh : Switch) : RoomState :=
   { r with switches := r.switches.map (fun w => if w.id = old.id then fresh else w) }
 
+def replaceExit (r : RoomState) (old fresh : Exit) : RoomState :=
+  { r with exits := r.exits.map (fun e => if e.id = old.id then fresh else e) }
+
 def rotateOrientation : BridgeOrientation → BridgeOrientation
   | .horizontal => .vertical
   | .vertical => .horizontal
@@ -406,6 +412,64 @@ theorem activateSwitchState_current_bounds
       exact fun h => hsame h.symm
     simp [setRoom, hother, replaceSwitch]
 
+def exitRequirementSatisfied (s : WorldState) (exit : Exit) : Prop :=
+  match exit.kind with
+  | .locked =>
+      exit.opened = true ∨ requirementSatisfied s exit.requirement
+  | .normal | .conditional =>
+      requirementSatisfied s exit.requirement
+
+def spendExitRequirement
+    (inventory : Inventory) (exit : Exit) : Inventory :=
+  match exit.kind, exit.opened with
+  | .locked, false => spendRequirement inventory exit.requirement
+  | _, _ => inventory
+
+def unlockExitInRoom (room : RoomState) (exit : Exit) : RoomState :=
+  match exit.kind, exit.opened with
+  | .locked, false =>
+      replaceExit room exit { exit with opened := true }
+  | _, _ => room
+
+@[simp] theorem unlockExitInRoom_bounds
+    (room : RoomState) (exit : Exit) :
+    (unlockExitInRoom room exit).bounds = room.bounds := by
+  cases hkind : exit.kind <;> cases hopen : exit.opened <;>
+    simp [unlockExitInRoom, hkind, hopen, replaceExit]
+
+def transitionThroughExit (s : WorldState) (exit : Exit) : WorldState :=
+  let sourceRoom := unlockExitInRoom (currentRoomState s) exit
+  let roomsAfterUnlock := setRoom s.rooms s.currentRoom sourceRoom
+  { s with
+    currentRoom := exit.targetRoom
+    rooms := roomsAfterUnlock
+    player :=
+      { s.player with
+        pos := exit.targetSpawn
+        inventory := spendExitRequirement s.player.inventory exit
+        shielding := false }
+    completed := s.completed || exit.completesTask }
+
+theorem transitionThroughExit_target_bounds
+    (s : WorldState) (exit : Exit) :
+    (currentRoomState (transitionThroughExit s exit)).bounds =
+      (s.rooms exit.targetRoom).bounds := by
+  unfold transitionThroughExit currentRoomState
+  by_cases hsame : exit.targetRoom = s.currentRoom
+  · rw [hsame]
+    simp [setRoom]
+  · simp [setRoom, hsame]
+
+theorem requirement_implies_exitRequirementSatisfied
+    {s : WorldState} {exit : Exit}
+    (h : requirementSatisfied s exit.requirement) :
+    exitRequirementSatisfied s exit := by
+  unfold exitRequirementSatisfied
+  cases exit.kind with
+  | normal => exact h
+  | locked => exact Or.inr h
+  | conditional => exact h
+
 /-! ## 六、事件与单步状态转移语义
 
 事件不是隐藏真值输入，而是 Lean 模型对一次符号转移结果的说明，便于之后
@@ -435,6 +499,16 @@ inductive Event where
   | environmentCompleted
   deriving DecidableEq, Repr
 
+def exitEvents (s : WorldState) (exit : Exit) : List Event :=
+  let doorEvents :=
+    match exit.kind, exit.opened with
+    | .locked, false => [.doorOpened exit.id]
+    | _, _ => []
+  let roomEvents := [.roomChanged s.currentRoom exit.targetRoom]
+  let completionEvents :=
+    if exit.completesTask then [.environmentCompleted] else []
+  doorEvents ++ roomEvents ++ completionEvents
+
 def validPlayerPosition (s : WorldState) : Prop :=
   let r := currentRoomState s
   inBounds r.bounds s.player.pos ∧ ¬ staticBlocker r s.player.pos ∧ ¬ gapAt r s.player.pos
@@ -446,6 +520,55 @@ def ValidState (s : WorldState) : Prop :=
   inBounds (currentRoomState s).bounds s.player.pos ∧
   s.player.hp ≤ s.player.maxHp
 
+/-! ### 世界与房间配置的良构性
+
+`WellFormedWorld` 是运行时必须保持的核心良构条件：房间索引非空且无重复，
+当前房间确实属于索引，并且玩家状态合法。出口目标属于有限房间集合这一事实
+单独写成 `ExitTargetsKnown`，供房间切换的保持性证明使用。
+
+`RoomConfigurationWellFormed` 检查关卡模板中的静态对象位置。它覆盖墙、
+NPC、宝箱、怪物、陷阱、按钮、开关、桥的两组候选 tile、动态 tile 和出口；
+出口 spawn 则由 `ExitSpawnsInBounds` 相对于目标房间检查。
+-/
+
+def allPositionsInBounds (bounds : Bounds) (positions : List Position) : Prop :=
+  ∀ p, p ∈ positions → inBounds bounds p
+
+def RoomConfigurationWellFormed (room : RoomState) : Prop :=
+  allPositionsInBounds room.bounds room.walls ∧
+  allPositionsInBounds room.bounds (room.npcs.map Npc.pos) ∧
+  allPositionsInBounds room.bounds (room.chests.map Chest.pos) ∧
+  allPositionsInBounds room.bounds (room.monsters.map Monster.pos) ∧
+  allPositionsInBounds room.bounds (room.traps.map Trap.pos) ∧
+  allPositionsInBounds room.bounds (room.traps.map Trap.respawn) ∧
+  allPositionsInBounds room.bounds (room.buttons.map Button.pos) ∧
+  allPositionsInBounds room.bounds (room.switches.map Switch.pos) ∧
+  (∀ bridge, bridge ∈ room.bridges →
+    allPositionsInBounds room.bounds bridge.horizontalTiles ∧
+    allPositionsInBounds room.bounds bridge.verticalTiles) ∧
+  allPositionsInBounds room.bounds (room.dynamicTiles.map Prod.fst) ∧
+  allPositionsInBounds room.bounds (room.exits.map Exit.pos)
+
+def ExitTargetsKnown (s : WorldState) : Prop :=
+  ∀ roomId, roomId ∈ s.roomIds →
+    ∀ exit, exit ∈ (s.rooms roomId).exits →
+      exit.targetRoom ∈ s.roomIds
+
+def ExitSpawnsInBounds (s : WorldState) : Prop :=
+  ∀ roomId, roomId ∈ s.roomIds →
+    ∀ exit, exit ∈ (s.rooms roomId).exits →
+      inBounds (s.rooms exit.targetRoom).bounds exit.targetSpawn
+
+def AllRoomConfigurationsWellFormed (s : WorldState) : Prop :=
+  ∀ roomId, roomId ∈ s.roomIds →
+    RoomConfigurationWellFormed (s.rooms roomId)
+
+def WellFormedWorld (s : WorldState) : Prop :=
+  s.roomIds ≠ [] ∧
+  s.roomIds.Nodup ∧
+  s.currentRoom ∈ s.roomIds ∧
+  ValidState s
+
 def alive (s : WorldState) : Prop := 0 < s.player.hp
 def dead (s : WorldState) : Prop := s.player.hp = 0
 
@@ -455,6 +578,7 @@ def allVisibleChestsOpened (r : RoomState) : Prop :=
 
 def allWorldChestsOpened (s : WorldState) : Prop :=
   s.roomIds ≠ [] ∧
+  (∃ roomId ∈ s.roomIds, ∃ chest, chest ∈ (s.rooms roomId).chests) ∧
   ∀ roomId, roomId ∈ s.roomIds →
     allVisibleChestsOpened (s.rooms roomId)
 
@@ -595,31 +719,29 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
         [.talkedNpc npc.id]
 
   -- 未击杀攻击：必须有剑且怪物正好位于面前一格，扣除攻击力对应的 HP。
-  | attackDamage {s : WorldState} {monster : Monster} {power : Nat}
+  | attackDamage {s : WorldState} {monster : Monster}
       (hnoInteraction : ¬ primaryInteractionAvailable s)
       (hsword : Item.sword ∈ s.player.inventory.items)
       (hmember : monster ∈ (currentRoomState s).monsters)
       (htarget : monster.pos = advance s.player.pos s.player.facing)
-      (hpower : 0 < power)
-      (hsurvives : power < monster.hp) :
+      (hsurvives : swordDamage < monster.hp) :
       Step s .slotA
         (updateCurrentRoom
           { s with player := { s.player with shielding := false } }
           (replaceMonster (currentRoomState s) monster
-            { monster with hp := monster.hp - power }))
+            { monster with hp := monster.hp - swordDamage }))
         [.monsterDamaged monster.id]
 
   -- 击杀攻击：从房间怪物列表删除目标，并把配置的击杀金币加入背包。
-  | attackKill {s : WorldState} {monster : Monster} {power reward : Nat}
+  | attackKill {s : WorldState} {monster : Monster}
       (hnoInteraction : ¬ primaryInteractionAvailable s)
       (hsword : Item.sword ∈ s.player.inventory.items)
       (hmember : monster ∈ (currentRoomState s).monsters)
       (htarget : monster.pos = advance s.player.pos s.player.facing)
-      (hpower : 0 < power)
-      (hkilled : monster.hp ≤ power) :
+      (hkilled : monster.hp ≤ swordDamage) :
       Step s .slotA
         (updateCurrentRoom
-          { s with player := rewardPlayer s.player reward }
+          { s with player := rewardPlayer s.player monsterKillGold }
           (removeMonster (currentRoomState s) monster))
         [.monsterKilled monster.id]
 
@@ -679,30 +801,19 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
       (hmember : exit ∈ (currentRoomState s).exits)
       (hat : s.player.pos = exit.pos)
       (hfacing : s.player.facing = exit.direction)
-      (hreq : requirementSatisfied s exit.requirement)
+      (hreq : exitRequirementSatisfied s exit)
       (htarget : target = s.rooms exit.targetRoom)
       (hspawn : canEnter target exit.targetSpawn) :
       Step s (directionAction exit.direction)
-        { s with
-          currentRoom := exit.targetRoom
-          player :=
-            { s.player with
-              pos := exit.targetSpawn
-              inventory := spendRequirement s.player.inventory exit.requirement
-              shielding := false }
-          completed := s.completed || exit.completesTask }
-        (if exit.completesTask then
-          [.doorOpened exit.id, .roomChanged s.currentRoom exit.targetRoom,
-           .environmentCompleted]
-         else
-          [.doorOpened exit.id, .roomChanged s.currentRoom exit.targetRoom])
+        (transitionThroughExit s exit)
+        (exitEvents s exit)
 
   -- 出口条件不满足时，状态保持不变并记录阻挡。
   | exitBlocked {s : WorldState} {exit : Exit}
       (hmember : exit ∈ (currentRoomState s).exits)
       (hat : s.player.pos = exit.pos)
       (hfacing : s.player.facing = exit.direction)
-      (hreq : ¬ requirementSatisfied s exit.requirement) :
+      (hreq : ¬ exitRequirementSatisfied s exit) :
       Step s (directionAction exit.direction) s [.blocked exit.pos]
 
   -- Task5 没有完成型出口：Python 在所有有限模板房间的宝箱均可见且打开后完成。
@@ -710,7 +821,75 @@ inductive Step : WorldState → Action → WorldState → List Event → Prop wh
       (hobjective : allWorldChestsOpened s) :
       Step s .wait { s with completed := true } [.environmentCompleted]
 
-/-! ## 七、目标谓词
+/-! ## 七、Python tick 的分层调度
+
+`Step` 是单个符号微步。下面进一步区分玩家主动阶段和环境自主阶段：
+
+* `PlayerStep` 要求世界仍在运行，并排除纯怪物/接触/完成结算事件；
+* `AutonomousStep` 只接受怪物移动、怪物接触、盾牌格挡或全宝箱完成；
+* `EngineTick` 强制每个 tick 先有且只有一个玩家阶段，再执行零个或多个自主
+  结算微步。
+
+这比直接使用无约束 `Exec` 更接近 Python engine 的调度顺序，也保证死亡或
+已完成状态不能再开始新的玩家动作。
+-/
+
+def Running (s : WorldState) : Prop :=
+  alive s ∧ s.completed = false
+
+def AutonomousOnlyEvents : List Event → Prop
+  | [.monsterMoved _ _ _] => True
+  | [.agentDamaged _] => True
+  | [.shieldBlock _] => True
+  | [.environmentCompleted] => True
+  | _ => False
+
+structure PlayerStep
+    (s : WorldState) (a : Action) (t : WorldState) (events : List Event) : Prop where
+  running : Running s
+  step : Step s a t events
+  agent_phase : ¬ AutonomousOnlyEvents events
+
+structure AutonomousStep
+    (s t : WorldState) (events : List Event) : Prop where
+  step : Step s .wait t events
+  autonomous_phase : AutonomousOnlyEvents events
+
+inductive AutonomousExec : WorldState → WorldState → Prop where
+  | nil {s : WorldState} : AutonomousExec s s
+  | cons {s t u : WorldState} {events : List Event} :
+      AutonomousStep s t events →
+      AutonomousExec t u →
+      AutonomousExec s u
+
+inductive EngineTick : WorldState → Action → WorldState → Prop where
+  | mk {s afterPlayer t : WorldState} {action : Action}
+      {playerEvents : List Event} :
+      PlayerStep s action afterPlayer playerEvents →
+      AutonomousExec afterPlayer t →
+      EngineTick s action t
+
+theorem dead_state_has_no_player_step
+    {s t : WorldState} {a : Action} {events : List Event}
+    (hdead : dead s) :
+    ¬ PlayerStep s a t events := by
+  intro h
+  have halive := h.running.1
+  unfold dead at hdead
+  unfold alive at halive
+  rw [hdead] at halive
+  exact Nat.lt_irrefl 0 halive
+
+theorem completed_state_has_no_player_step
+    {s t : WorldState} {a : Action} {events : List Event}
+    (hcompleted : s.completed = true) :
+    ¬ PlayerStep s a t events := by
+  intro h
+  have hnotComplete := h.running.2
+  rw [hcompleted] at hnotComplete
+  contradiction
+
+/-! ## 八、目标谓词
 
 先定义可直接复用的原子目标，再用 `Goal` 和 `GoalHolds` 给出统一解释器。
 五个 Task 可以通过 `Goal.both` 组合“拿钥匙、清怪、按按钮、到房间、通关”
@@ -756,7 +935,7 @@ def GoalHolds (s : WorldState) : Goal → Prop
   | .worldCompleted => WorldCompleted s
   | .both left right => GoalHolds s left ∧ GoalHolds s right
 
-/-! ## 八、多步执行轨迹
+/-! ## 九、多步执行轨迹
 
 `Exec s actions t` 是 `Step` 的列表闭包：空动作保持原状态；非空轨迹由一次
 合法 `Step` 和剩余轨迹组成。后续策略形式化会用它表达“执行 planner 给出的
@@ -768,7 +947,7 @@ inductive Exec : WorldState → List Action → WorldState → Prop where
   | cons {s t u : WorldState} {a : Action} {actions : List Action} {events : List Event} :
       Step s a t events → Exec t actions u → Exec s (a :: actions) u
 
-/-! ## 九、基础安全性与不变量证明
+/-! ## 十、基础安全性与不变量证明
 
 本节对应环境形式化评分中的“基本安全性或不变量”。证明覆盖房间更新、
 生命上界、合法移动、静态障碍、宝箱资源、攻击、按钮、桥、盾牌、陷阱、
@@ -859,13 +1038,12 @@ theorem step_preserves_validState
             (loot := chest.loot) hvalid.2)
   | talkNpc hnoChest hmember hadj =>
       exact hvalid
-  | attackDamage hnoInteraction hsword hmember htarget hpower hsurvives =>
+  | attackDamage hnoInteraction hsword hmember htarget hsurvives =>
       constructor
       · simpa [currentRoomState, updateCurrentRoom, setRoom, replaceMonster]
           using hvalid.1
       · exact hvalid.2
-  | @attackKill monster power reward hnoInteraction hsword hmember htarget
-      hpower hkilled =>
+  | @attackKill monster hnoInteraction hsword hmember htarget hkilled =>
       constructor
       · simpa [currentRoomState, updateCurrentRoom, setRoom, removeMonster,
           rewardPlayer]
@@ -891,12 +1069,76 @@ theorem step_preserves_validState
       · exact hvalid.2
   | useExit hmember hat hfacing hreq htarget hspawn =>
       constructor
-      · simpa [currentRoomState, htarget] using hspawn.1
+      · rw [transitionThroughExit_target_bounds]
+        simpa [transitionThroughExit, htarget] using hspawn.1
       · exact hvalid.2
   | exitBlocked hmember hat hfacing hreq =>
       exact hvalid
   | completeAllChests hobjective =>
       exact hvalid
+
+theorem step_preserves_roomIds
+    {s t : WorldState} {a : Action} {events : List Event}
+    (hstep : Step s a t events) :
+    t.roomIds = s.roomIds := by
+  cases hstep <;> rfl
+
+theorem step_currentRoom_remains_known
+    {s t : WorldState} {a : Action} {events : List Event}
+    (hcurrent : s.currentRoom ∈ s.roomIds)
+    (htargets : ExitTargetsKnown s)
+    (hstep : Step s a t events) :
+    t.currentRoom ∈ t.roomIds := by
+  have hcurrentTargets :
+      ∀ exit, exit ∈ (currentRoomState s).exits →
+        exit.targetRoom ∈ s.roomIds := by
+    intro exit hmember
+    exact htargets s.currentRoom hcurrent exit hmember
+  cases hstep <;>
+    simp_all [updateCurrentRoom, activateSwitchState, transitionThroughExit,
+      ExitTargetsKnown, currentRoomState]
+
+/-!
+核心世界良构性的保持定理。普通动作不改变当前房间；出口动作虽然改变当前
+房间，但 `ExitTargetsKnown` 保证目标 ID 属于同一个有限房间索引。玩家界内和
+HP 上界由 `step_preserves_validState` 统一处理。
+-/
+theorem step_preserves_wellFormedWorld
+    {s t : WorldState} {a : Action} {events : List Event}
+    (hwell : WellFormedWorld s)
+    (htargets : ExitTargetsKnown s)
+    (hstep : Step s a t events) :
+    WellFormedWorld t := by
+  rcases hwell with ⟨hnonempty, hnodup, hcurrent, hvalid⟩
+  have hids : t.roomIds = s.roomIds := step_preserves_roomIds hstep
+  constructor
+  · simpa [hids] using hnonempty
+  constructor
+  · simpa [hids] using hnodup
+  constructor
+  · exact step_currentRoom_remains_known hcurrent htargets hstep
+  · exact step_preserves_validState hvalid hstep
+
+theorem autonomousExec_preserves_validState
+    {s t : WorldState}
+    (hvalid : ValidState s)
+    (hexec : AutonomousExec s t) :
+    ValidState t := by
+  induction hexec with
+  | nil => exact hvalid
+  | cons hstep hrest ih =>
+      exact ih (step_preserves_validState hvalid hstep.step)
+
+theorem engineTick_preserves_validState
+    {s t : WorldState} {action : Action}
+    (hvalid : ValidState s)
+    (htick : EngineTick s action t) :
+    ValidState t := by
+  cases htick with
+  | mk hplayer hautonomous =>
+      have hafter : ValidState _ :=
+        step_preserves_validState hvalid hplayer.step
+      exact autonomousExec_preserves_validState hafter hautonomous
 
 -- 通行性分解：从 canEnter 可以直接推出界内、非墙和非可见宝箱。
 theorem canEnter_inBounds {r : RoomState} {p : Position}
@@ -994,6 +1236,19 @@ theorem consuming_key_requirement_spends_keys
     (spendRequirement inv (.keys count true)).keys = inv.keys - count := by
   rfl
 
+theorem opened_locked_exit_does_not_spend_again
+    (inv : Inventory) (exit : Exit)
+    (hkind : exit.kind = .locked) (hopened : exit.opened = true) :
+    (spendExitRequirement inv exit).keys = inv.keys := by
+  simp [spendExitRequirement, hkind, hopened]
+
+theorem unopened_locked_key_exit_spends_exactly
+    (inv : Inventory) (exit : Exit) (count : Nat)
+    (hkind : exit.kind = .locked) (hopened : exit.opened = false)
+    (hrequirement : exit.requirement = .keys count true) :
+    (spendExitRequirement inv exit).keys = inv.keys - count := by
+  simp [spendExitRequirement, hkind, hopened, hrequirement, spendRequirement]
+
 theorem free_requirement_is_satisfied (s : WorldState) :
     requirementSatisfied s .free := by
   trivial
@@ -1029,16 +1284,9 @@ theorem fatal_trap_keeps_zero_hp_at_trigger
 
 -- 房间切换：成功出口准确写入目标房间和 spawn，完成出口设置 completed。
 theorem successful_exit_enters_target_room (s : WorldState) (exit : Exit) :
-    let t : WorldState :=
-      { s with
-        currentRoom := exit.targetRoom
-        player :=
-          { s.player with
-            pos := exit.targetSpawn
-            inventory := spendRequirement s.player.inventory exit.requirement
-            shielding := false }
-        completed := s.completed || exit.completesTask }
-    t.currentRoom = exit.targetRoom ∧ t.player.pos = exit.targetSpawn := by
+    (transitionThroughExit s exit).currentRoom = exit.targetRoom ∧
+    (transitionThroughExit s exit).player.pos = exit.targetSpawn := by
+  unfold transitionThroughExit
   exact ⟨rfl, rfl⟩
 
 theorem successful_exit_spawn_in_bounds
@@ -1051,16 +1299,8 @@ theorem successful_exit_spawn_in_bounds
 
 theorem completed_exit_sets_world_completed
     (s : WorldState) (exit : Exit) (hcomplete : exit.completesTask = true) :
-    WorldCompleted
-      { s with
-        currentRoom := exit.targetRoom
-        player :=
-          { s.player with
-            pos := exit.targetSpawn
-            inventory := spendRequirement s.player.inventory exit.requirement
-            shielding := false }
-        completed := s.completed || exit.completesTask } := by
-  simp [WorldCompleted, hcomplete]
+    WorldCompleted (transitionThroughExit s exit) := by
+  simp [WorldCompleted, transitionThroughExit, hcomplete]
 
 -- 轨迹代数：两段可执行轨迹可以拼接，空轨迹当且仅当终态等于初态。
 theorem exec_append {s t u : WorldState} {xs ys : List Action}
@@ -1427,14 +1667,7 @@ def stateAfterOpeningChest (s : WorldState) (chest : Chest) : WorldState :=
     (replaceChest (currentRoomState s) chest { chest with opened := true })
 
 def stateAfterUsingExit (s : WorldState) (exit : Exit) : WorldState :=
-  { s with
-    currentRoom := exit.targetRoom
-    player :=
-      { s.player with
-        pos := exit.targetSpawn
-        inventory := spendRequirement s.player.inventory exit.requirement
-        shielding := false }
-    completed := s.completed || exit.completesTask }
+  transitionThroughExit s exit
 
 theorem task1_open_key_chest_gives_key
     {s : WorldState} {chest : Chest} {amount : Nat}
@@ -1474,12 +1707,9 @@ theorem task1_completable_if_subplans_exist
   have hExitStep :
       Step atExit (directionAction exit.direction)
         (stateAfterUsingExit atExit exit)
-        (if exit.completesTask then
-          [.doorOpened exit.id, .roomChanged atExit.currentRoom exit.targetRoom,
-           .environmentCompleted]
-         else
-          [.doorOpened exit.id, .roomChanged atExit.currentRoom exit.targetRoom]) := by
-    exact Step.useExit hExitMember hAtExit hFacingExit hRequirement
+        (exitEvents atExit exit) := by
+    exact Step.useExit hExitMember hAtExit hFacingExit
+      (requirement_implies_exitRequirementSatisfied hRequirement)
       hTargetRoom hSpawn
   have hExitExec :
       Exec atExit [directionAction exit.direction]
@@ -1500,7 +1730,7 @@ theorem task1_completable_if_subplans_exist
         (stateAfterUsingExit atExit exit) :=
     exec_append hPhase2 hExitExec
   refine ⟨_, _, hAll, ?_⟩
-  unfold Task1Goal WorldCompleted stateAfterUsingExit
+  unfold Task1Goal WorldCompleted stateAfterUsingExit transitionThroughExit
   simp [hCompletes]
 
 /-!
@@ -1999,12 +2229,9 @@ theorem task2_completable_if_subplans_exist
   have hExitStep :
       Step atExit (directionAction exit.direction)
         (stateAfterUsingExit atExit exit)
-        (if exit.completesTask then
-          [.doorOpened exit.id, .roomChanged atExit.currentRoom exit.targetRoom,
-           .environmentCompleted]
-         else
-          [.doorOpened exit.id, .roomChanged atExit.currentRoom exit.targetRoom]) :=
-    Step.useExit hExitMember hAtExit hFacingExit hRequirement
+        (exitEvents atExit exit) :=
+    Step.useExit hExitMember hAtExit hFacingExit
+      (requirement_implies_exitRequirementSatisfied hRequirement)
       hTargetRoom hSpawn
   have hExitExec :
       Exec atExit [directionAction exit.direction]
@@ -2033,7 +2260,7 @@ theorem task2_completable_if_subplans_exist
         (stateAfterUsingExit atExit exit) :=
     exec_append hPhase4 hExitExec
   refine ⟨_, _, hAll, ?_⟩
-  unfold Task2Goal WorldCompleted stateAfterUsingExit
+  unfold Task2Goal WorldCompleted stateAfterUsingExit transitionThroughExit
   simp [hCompletes]
 
 /-!
@@ -2203,7 +2430,7 @@ def task2PublicNearMonsterWorld : WorldState :=
     completed := false }
 
 def task2PublicDamagedMonster : Monster :=
-  { task2PublicMonster with hp := 1 }
+  { task2PublicMonster with hp := task2PublicMonster.hp - swordDamage }
 
 def task2PublicAfterFirstHit : WorldState :=
   updateCurrentRoom
@@ -2214,14 +2441,14 @@ def task2PublicAfterFirstHit : WorldState :=
 def task2PublicAfterKill : WorldState :=
   updateCurrentRoom
     { task2PublicAfterFirstHit with
-      player := rewardPlayer task2PublicAfterFirstHit.player 1 }
+      player := rewardPlayer task2PublicAfterFirstHit.player monsterKillGold }
     (removeMonster (currentRoomState task2PublicAfterFirstHit)
       task2PublicDamagedMonster)
 
 theorem task2_public_first_attack_damages :
     Step task2PublicNearMonsterWorld .slotA task2PublicAfterFirstHit
       [.monsterDamaged task2PublicMonster.id] := by
-  apply Step.attackDamage (power := 1) (monster := task2PublicMonster)
+  apply Step.attackDamage (monster := task2PublicMonster)
   · simp [primaryInteractionAvailable, openChestInteractionAvailable,
       npcInteractionAvailable, switchInteractionAvailable,
       task2PublicNearMonsterWorld, task2PublicPlayerAtMonster,
@@ -2232,13 +2459,11 @@ theorem task2_public_first_attack_damages :
       task2PublicRoom]
   · rfl
   · decide
-  · decide
 
 theorem task2_public_second_attack_kills :
     Step task2PublicAfterFirstHit .slotA task2PublicAfterKill
       [.monsterKilled task2PublicDamagedMonster.id] := by
-  apply Step.attackKill
-      (monster := task2PublicDamagedMonster) (power := 1) (reward := 1)
+  apply Step.attackKill (monster := task2PublicDamagedMonster)
   · simp [primaryInteractionAvailable, openChestInteractionAvailable,
       npcInteractionAvailable, switchInteractionAvailable,
       task2PublicAfterFirstHit, task2PublicNearMonsterWorld,
@@ -2252,7 +2477,6 @@ theorem task2_public_second_attack_kills :
       task2PublicMonster, task2PublicRoom, task2PublicNearMonsterWorld,
       currentRoomState, updateCurrentRoom, setRoom, replaceMonster]
   · rfl
-  · decide
   · decide
 
 theorem task2_public_combat_exec :
@@ -2973,10 +3197,12 @@ def ChestSchedulerComplete (s : WorldState) : Prop :=
 theorem visibility_and_fair_scheduler_open_all_chests
     {s : WorldState}
     (hnonempty : s.roomIds ≠ [])
+    (hhasChest :
+      ∃ roomId ∈ s.roomIds, ∃ chest, chest ∈ (s.rooms roomId).chests)
     (hvisible : AllObjectiveChestsVisible s)
     (hscheduled : ChestSchedulerComplete s) :
     allWorldChestsOpened s := by
-  refine ⟨hnonempty, ?_⟩
+  refine ⟨hnonempty, hhasChest, ?_⟩
   intro roomId hroom chest hchest
   exact ⟨
     hvisible roomId hroom chest hchest,
@@ -3018,6 +3244,9 @@ structure Task5Assumptions
   symbolic_memory_sound : Task5MemorySound allOpened memory
   finite_nonempty_world : initial.roomIds ≠ []
   room_set_preserved : allOpened.roomIds = initial.roomIds
+  objective_chest_exists :
+    ∃ roomId ∈ allOpened.roomIds,
+      ∃ chest, chest ∈ (allOpened.rooms roomId).chests
   planner_execution : Exec initial plan allOpened
   every_objective_chest_visible : AllObjectiveChestsVisible allOpened
   fair_chest_scheduler : ChestSchedulerComplete allOpened
@@ -3033,7 +3262,8 @@ theorem task5_policy_complete_under_assumptions
     exact h.finite_nonempty_world
   have hchests : allWorldChestsOpened allOpened :=
     visibility_and_fair_scheduler_open_all_chests
-      hnonempty h.every_objective_chest_visible h.fair_chest_scheduler
+      hnonempty h.objective_chest_exists
+      h.every_objective_chest_visible h.fair_chest_scheduler
   exact task5_completable_after_all_chests_opened
     h.planner_execution hchests
 
@@ -3096,12 +3326,14 @@ theorem task5_public_all_rooms_reachable :
 theorem task5_four_open_rooms_satisfy_chest_objective
     (s : WorldState)
     (hids : s.roomIds = task5PublicRoomIds)
+    (hhasChest :
+      ∃ roomId ∈ s.roomIds, ∃ chest, chest ∈ (s.rooms roomId).chests)
     (hcenter : allVisibleChestsOpened (s.rooms task5Center))
     (hsouth : allVisibleChestsOpened (s.rooms task5South))
     (hwest : allVisibleChestsOpened (s.rooms task5West))
     (heast : allVisibleChestsOpened (s.rooms task5East)) :
     allWorldChestsOpened s := by
-  constructor
+  refine ⟨?_, hhasChest, ?_⟩
   · rw [hids]
     simp [task5PublicRoomIds]
   · intro room hroom
