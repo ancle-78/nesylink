@@ -101,6 +101,17 @@ BLOCKING_KINDS = {
     "npc",
     "unknown",
 }
+
+# 历史视觉中一旦明确看见，就按当前房间的静态阻挡/危险记忆下来。这里不包含
+# monster/player，也不包含 button/switch/exit/bridge。Task 5 的 gap 可能被
+# switch 变成 bridge，因此不作为永久静态阻挡，只依赖当前帧和卡住反馈。
+STATIC_BLOCKING_KINDS = {
+    "wall",
+    "chest",
+    "trap",
+    "abyss",
+    "npc",
+}
 SAFE_WALKABLE_KINDS = {
     "floor",
     "player",
@@ -123,6 +134,7 @@ class RoomMemory:
 
     visited: bool = False
     remembered_chests: set[Position] = field(default_factory=set)
+    remembered_static_blocked: set[Position] = field(default_factory=set)
     opened_chests: set[Position] = field(default_factory=set)
     pressed_buttons: set[Position] = field(default_factory=set)
     known_exits: dict[str, Position] = field(default_factory=dict)
@@ -377,6 +389,7 @@ class Task5FSMBFSAgent:
         memory.visited = True
         for chest in self._chest_tiles(vision):
             memory.remembered_chests.add(chest)
+        memory.remembered_static_blocked.update(self._tiles_of_kind(vision, STATIC_BLOCKING_KINDS))
         for direction, tile in self._exit_tiles_by_direction(vision).items():
             memory.known_exits[direction] = tile
 
@@ -544,7 +557,7 @@ class Task5FSMBFSAgent:
                     vision,
                     allow_next_to_monster=allow_near_monster,
                     allow_goals_next_to_monster=allow_near_monster,
-                    extra_blocked=(memory.remembered_chests - {chest}) | memory.learned_blocked_tiles,
+                    extra_blocked=self._remembered_static_blockers(memory),
                     blocked_edges=memory.learned_blocked_edges,
                 )
             else:
@@ -553,7 +566,7 @@ class Task5FSMBFSAgent:
                     player,
                     adjacent,
                     vision,
-                    extra_blocked=(memory.remembered_chests - {chest}) | memory.learned_blocked_tiles,
+                    extra_blocked=self._remembered_static_blockers(memory),
                     blocked_edges=memory.learned_blocked_edges,
                 )
             if path:
@@ -578,7 +591,7 @@ class Task5FSMBFSAgent:
                 player,
                 {button},
                 vision,
-                extra_blocked=memory.remembered_chests | memory.learned_blocked_tiles,
+                extra_blocked=self._remembered_static_blockers(memory),
                 blocked_edges=memory.learned_blocked_edges,
             )
             if path:
@@ -628,7 +641,7 @@ class Task5FSMBFSAgent:
                 adjacent,
                 vision,
                 allow_goals_next_to_monster=True,
-                extra_blocked=memory.remembered_chests | memory.learned_blocked_tiles,
+                extra_blocked=self._remembered_static_blockers(memory),
                 blocked_edges=memory.learned_blocked_edges,
             )
             if path:
@@ -659,7 +672,7 @@ class Task5FSMBFSAgent:
                 adjacent,
                 vision,
                 allow_goals_next_to_monster=True,
-                extra_blocked=memory.remembered_chests | memory.learned_blocked_tiles,
+                extra_blocked=self._remembered_static_blockers(memory),
                 blocked_edges=memory.learned_blocked_edges,
             )
             if path:
@@ -702,7 +715,7 @@ class Task5FSMBFSAgent:
                 adjacent,
                 vision,
                 allow_goals_next_to_monster=True,
-                extra_blocked=memory.remembered_chests | memory.learned_blocked_tiles,
+                extra_blocked=self._remembered_static_blockers(memory),
                 blocked_edges=memory.learned_blocked_edges,
             )
             if path:
@@ -760,7 +773,7 @@ class Task5FSMBFSAgent:
                     vision,
                     allow_next_to_monster=allow_near_monster,
                     allow_goals_next_to_monster=allow_near_monster,
-                    extra_blocked=(memory.remembered_chests - {target}) | memory.learned_blocked_tiles,
+                    extra_blocked=self._remembered_static_blockers(memory),
                     blocked_edges=memory.learned_blocked_edges,
                 )
             else:
@@ -769,7 +782,7 @@ class Task5FSMBFSAgent:
                     player,
                     adjacent,
                     vision,
-                    extra_blocked=(memory.remembered_chests - {target}) | memory.learned_blocked_tiles,
+                    extra_blocked=self._remembered_static_blockers(memory),
                     blocked_edges=memory.learned_blocked_edges,
                 )
         else:
@@ -778,7 +791,7 @@ class Task5FSMBFSAgent:
                 player,
                 adjacent,
                 vision,
-                extra_blocked=(memory.remembered_chests - {target}) | memory.learned_blocked_tiles,
+                extra_blocked=self._remembered_static_blockers(memory),
                 blocked_edges=memory.learned_blocked_edges,
             )
         if len(path) >= 2:
@@ -797,7 +810,7 @@ class Task5FSMBFSAgent:
             player,
             {button},
             vision,
-            extra_blocked=memory.remembered_chests | memory.learned_blocked_tiles,
+            extra_blocked=self._remembered_static_blockers(memory),
             blocked_edges=memory.learned_blocked_edges,
         )
         if len(path) >= 2:
@@ -836,7 +849,7 @@ class Task5FSMBFSAgent:
             adjacent,
             vision,
             allow_goals_next_to_monster=True,
-            extra_blocked=memory.remembered_chests | memory.learned_blocked_tiles,
+            extra_blocked=self._remembered_static_blockers(memory),
             blocked_edges=memory.learned_blocked_edges,
         )
         if len(path) >= 2:
@@ -890,7 +903,7 @@ class Task5FSMBFSAgent:
             # 出口目标可以落在同一边界的相邻格，但行走途中仍要尊重当前房间
             # 通过视觉反馈学到的“这条边会卡住”。否则 agent 会在像素碰撞点上
             # 重复撞同一个方向，尤其是回起点后再去另一个门时最明显。
-            extra_blocked=memory.remembered_chests | memory.learned_blocked_tiles,
+            extra_blocked=self._remembered_static_blockers(memory),
             blocked_edges=memory.learned_blocked_edges,
         )
         if len(path) >= 2:
@@ -1059,7 +1072,7 @@ class Task5FSMBFSAgent:
         if not in_bounds(nxt):
             return False
         memory = self._room_memory()
-        if nxt in memory.remembered_chests or nxt in memory.learned_blocked_tiles:
+        if nxt in self._remembered_static_blockers(memory):
             return False
         return is_walkable(nxt, vision, allow_next_to_monster=True)
 
@@ -1195,9 +1208,19 @@ class Task5FSMBFSAgent:
 
     def _is_walkable(self, pos: Position, vision: PixelObservation, *, allow_next_to_monster: bool = False) -> bool:
         memory = self._room_memory()
-        if pos in memory.remembered_chests or pos in memory.learned_blocked_tiles:
+        if pos in self._remembered_static_blockers(memory):
             return False
         return is_walkable(pos, vision, allow_next_to_monster=allow_next_to_monster)
+
+    def _remembered_static_blockers(self, memory: RoomMemory) -> set[Position]:
+        """返回当前房间历史视觉和卡住反馈确认的阻挡 tile。
+
+        ``remembered_chests`` 继续保留宝箱语义；``remembered_static_blocked`` 负责
+        墙、NPC、陷阱等历史静态阻挡。两者和 learned_blocked_tiles 合并后供 BFS
+        与 safety shield 使用。
+        """
+
+        return memory.remembered_static_blocked | memory.remembered_chests | memory.learned_blocked_tiles
 
 
 def bfs_path(
